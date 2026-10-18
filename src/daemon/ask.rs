@@ -303,9 +303,9 @@ $f = New-Object AskPanel
 $f.Text = $env:TINCAN_TITLE; $f.TopMost = $true; $f.StartPosition = 'CenterScreen'; $f.FormBorderStyle = 'FixedDialog'
 $f.MinimizeBox = $false; $f.MaximizeBox = $false; $f.AutoSize = $true; $f.AutoSizeMode = 'GrowAndShrink'; $f.Padding = 12
 $l = New-Object Windows.Forms.FlowLayoutPanel; $l.FlowDirection = 'TopDown'; $l.AutoSize = $true
-$q = New-Object Windows.Forms.Label; $q.UseMnemonic = $false; $q.Text = $env:TINCAN_BODY; $q.AutoSize = $true; $q.MaximumSize = '420,320'
+$q = New-Object Windows.Forms.Label; $q.UseMnemonic = $false; $q.UseCompatibleTextRendering = $false; $q.Text = $env:TINCAN_BODY; $q.AutoSize = $true; $q.MaximumSize = '420,320'
 # A question too long to show whole ends in "…" where the panel cuts it.
-$s = $q.Text; while ([Windows.Forms.TextRenderer]::MeasureText($q.Text, $q.Font, '420,0', 'WordBreak').Height -gt 320) { $s = $s.Substring(0, $s.Length - 20).TrimEnd(); $q.Text = $s + [char]0x2026 }
+$s = $q.Text; while ([Windows.Forms.TextRenderer]::MeasureText($q.Text, $q.Font, '420,0', 'WordBreak').Height -gt 320 -and $s) { $s = $s.Substring(0, [Math]::Max(0, $s.Length - 20)).TrimEnd(); $q.Text = $s + [char]0x2026 }
 $note = New-Object Windows.Forms.TextBox; $note.Width = 420
 $b = New-Object Windows.Forms.FlowLayoutPanel; $b.FlowDirection = 'RightToLeft'; $b.Width = 420; $b.Height = 34
 $yes = New-Object Windows.Forms.Button; $yes.Text = 'Approve'; $no = New-Object Windows.Forms.Button; $no.Text = 'Deny'
