@@ -433,14 +433,11 @@ impl Daemon {
         if !msg.from.starts_with(&format!("{sender}/")) {
             bail!("{} cannot send as {}", sender, msg.from);
         }
-        // An approval stands only if the sending machine signed it, as its own person, about a request from the session
-        // it came to; any other is dropped, and the message says so.
-        if let Some(a) = &msg.approval {
-            let signed = self.team_state().is_some_and(|t| a.verify(t.name(), "approval"));
-            if !(signed && a.by == peer && a.body.approver == sender && a.body.asker == msg.to) {
-                msg.approval = None;
-                msg.body.push_str("\n\n(It came with an approval that didn't verify.)");
-            }
+        if let Some(a) = &msg.approval
+            && !self.team_state().is_some_and(|t| approval_holds(a, t.name(), &peer, &sender, &msg.to))
+        {
+            msg.approval = None;
+            msg.body.push_str("\n\n(It came with an approval that didn't verify.)");
         }
         let policy = self.cfg.policy_for(&sender);
         if policy == Policy::Refuse {
@@ -606,6 +603,15 @@ fn tidy(s: &str, extra: &str, max: usize) -> Option<String> {
 }
 
 /// Validates a message from a peer and strips its metadata down to safe characters.
+/// Whether an approval that came from `peer` (a machine of `sender`'s) to the session `to` stands: signed by that
+/// machine for this team, as its own person's answer, to a request that session sent, and of a sane size. (Which request
+/// it answers is the approver's machine's word: the frame shows `about`, for the asking agent to match.)
+fn approval_holds(a: &Signed<Approval>, team: &str, peer: &EndpointId, sender: &str, to: &str) -> bool {
+    let b = &a.body;
+    let size = b.about.len() + b.asker.len() + b.question.len() + b.request.len() + b.note.len();
+    size <= 4000 && a.by == *peer && b.approver == sender && b.asker == to && a.verify(team, "approval")
+}
+
 fn clean(m: Message) -> Result<Message> {
     let ok = |s: &str, extra: &str| {
         !s.is_empty() && s.len() <= 120 && s.chars().all(|c| c.is_ascii_alphanumeric() || extra.contains(c))
@@ -636,4 +642,44 @@ where
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iroh::SecretKey;
+
+    fn approval(asker: &str, approver: &str) -> Approval {
+        Approval {
+            about: "01REQ".into(),
+            asker: asker.into(),
+            approver: approver.into(),
+            approved: true,
+            question: "Rename it?".into(),
+            request: "please rename billing".into(),
+            note: String::new(),
+            at: 1,
+        }
+    }
+
+    #[test]
+    fn an_approval_stands_only_from_its_approvers_machine_to_the_session_that_asked() {
+        let (bob, mallory) = (SecretKey::generate(), SecretKey::generate());
+        let real = Signed::new(approval("alice/api", "bob"), &bob, "acme", "approval");
+        assert!(approval_holds(&real, "acme", &bob.public(), "bob", "alice/api"));
+        // Passed on by another machine; claimed for bob by another person's machine; to another session; another team.
+        assert!(!approval_holds(&real, "acme", &mallory.public(), "mallory", "alice/api"));
+        let claimed = Signed::new(approval("alice/api", "bob"), &mallory, "acme", "approval");
+        assert!(!approval_holds(&claimed, "acme", &mallory.public(), "mallory", "alice/api"));
+        assert!(!approval_holds(&real, "acme", &bob.public(), "bob", "alice/other"));
+        assert!(!approval_holds(&real, "other", &bob.public(), "bob", "alice/api"));
+        // Changed after it was signed, or too big.
+        let mut changed = real.clone();
+        changed.body.approved = false;
+        assert!(!approval_holds(&changed, "acme", &bob.public(), "bob", "alice/api"));
+        let mut big = approval("alice/api", "bob");
+        big.note = "x".repeat(5000);
+        let big = Signed::new(big, &bob, "acme", "approval");
+        assert!(!approval_holds(&big, "acme", &bob.public(), "bob", "alice/api"));
+    }
 }

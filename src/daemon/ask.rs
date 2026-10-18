@@ -4,7 +4,7 @@
 
 use super::{Daemon, MAX_WAIT, log, mail::unregistered};
 use crate::{
-    proto::{Approval, Message},
+    proto::{Approval, HookCall, Message},
     team::Signed,
     util,
 };
@@ -31,7 +31,8 @@ pub(super) struct Asking {
     question: String,
     /// Calls waiting for its answer now.
     waiting: usize,
-    answer: Option<Answer>,
+    /// The answer, and what to add to it for the asking agent (whether a signed answer went to a teammate).
+    answer: Option<(Answer, String)>,
     /// Whether a waiting call has returned the answer.
     taken: bool,
 }
@@ -57,11 +58,17 @@ impl Daemon {
             };
             (asker, l.stop_gen, request)
         };
+        // A teammate's request comes first, in their words (cut only where it ends in "…"), and the agent's question gets
+        // the room left: the request the person sees is the one the signed answer says they saw.
+        let request = request.map(|m| {
+            let text = clip(&util::one_line(&m.body, 2000), 500);
+            (m, text)
+        });
+        let question = if request.is_some() { clip(&question, 400) } else { question };
         let shown = match &request {
-            Some(r) => format!("{question}\n\n{} asked: {}", r.from, util::one_line(&r.body, 300)),
+            Some((m, text)) => format!("{} asked: {text}\n\nYour agent asks: {question}", m.from),
             None => question.clone(),
         };
-        let signed_for = request.as_ref().map(|r| r.from.clone());
         {
             let mut asks = self.asks.lock().unwrap();
             match asks.get_mut(&key) {
@@ -93,12 +100,8 @@ impl Daemon {
             let woke = self.arrived.notified();
             tokio::pin!(woke);
             woke.as_mut().enable();
-            if let Some(answer) = waiting.take() {
-                let said = self.said(&answer)?;
-                return Ok(match (&signed_for, &answer) {
-                    (Some(to), Answer::Approved(_) | Answer::Denied(_)) => format!("{said} (Sent to {to}, signed.)"),
-                    _ => said,
-                });
+            if let Some((answer, receipt)) = waiting.take() {
+                return Ok(format!("{}{receipt}", self.said(&answer)?));
             }
             let gave_up = self.inner.lock().unwrap().live.get(&key).is_none_or(|l| l.stop_gen != stop);
             if gave_up || tokio::time::Instant::now() >= deadline {
@@ -127,7 +130,7 @@ impl Daemon {
 
     /// Shows the question until it is answered or closes, then hands the answer to the calls waiting for it (and, for
     /// a teammate's request, to its sender).
-    async fn pop_up(self: Arc<Self>, key: String, question: String, request: Option<Message>, cmd: Command) {
+    async fn pop_up(self: Arc<Self>, key: String, question: String, request: Option<(Message, String)>, cmd: Command) {
         let mut cmd = tokio::process::Command::from(cmd);
         let out = tokio::time::timeout(Duration::from_secs(OPEN_SECS + 60), cmd.kill_on_drop(true).output()).await;
         let answer = match out {
@@ -139,50 +142,84 @@ impl Daemon {
         if let Answer::Failed(e) = &answer {
             log(&format!("pop-up failed: {e}"));
         }
-        let up = {
+        // The teammate's answer goes first, so the calls waiting can say whether it went.
+        let receipt = match &request {
+            Some((m, text)) => self.send_approval(&key, m, text, &question, &answer).await,
+            None => String::new(),
+        };
+        let waited = {
             let mut asks = self.asks.lock().unwrap();
             let Some(up) = asks.get_mut(&key) else { return };
             let waited = up.waiting > 0;
             if waited {
-                up.answer = Some(answer.clone());
+                up.answer = Some((answer.clone(), receipt));
             } else {
                 asks.remove(&key);
             }
             waited
         };
-        if up {
+        if waited {
             self.arrived.notify_waiters();
         } else {
             self.answer_later(&key, &question, &answer);
         }
-        if let Some(request) = &request {
-            self.send_approval(&key, request, &question, &answer).await;
-        }
     }
 
-    /// The person's answer to a teammate's request, signed by this machine, to the session that sent the request.
-    async fn send_approval(self: &Arc<Self>, key: &str, request: &Message, question: &str, answer: &Answer) {
+    /// The person's answer to a teammate's request, with what they saw, signed by this machine, to the session that sent
+    /// the request: from the asking session, or this person's terminal if that has gone. Says whether it went.
+    async fn send_approval(
+        self: &Arc<Self>,
+        key: &str,
+        request: &Message,
+        shown: &str,
+        question: &str,
+        answer: &Answer,
+    ) -> String {
         let (approved, note) = match answer {
             Answer::Approved(n) => (true, n),
             Answer::Denied(n) => (false, n),
-            _ => return,
+            _ => return String::new(),
         };
-        let (Some(team), Ok(said)) = (self.team_state(), self.said(answer)) else { return };
+        let (Some(team), Ok(said)) = (self.team_state(), self.said(answer)) else { return String::new() };
         let approval = Approval {
             about: request.id.clone(),
             asker: request.from.clone(),
             approver: self.person.clone(),
             approved,
             question: question.to_string(),
-            request: util::one_line(&request.body, 300),
-            note: note.clone(),
+            request: shown.to_string(),
+            note: clip(note, 500),
             at: util::now_ms(),
         };
         let signed = Box::new(Signed::new(approval, &self.key, team.name(), "approval"));
-        let sent = self.send(key.into(), &request.from, &said, Some(request.id.clone()), true, false, Some(signed));
-        if let Err(e) = sent.await {
-            log(&format!("couldn't send {}'s answer to {}: {e}", self.person, request.from));
+        let live = self.inner.lock().unwrap().live.contains_key(key);
+        let from = if live { key.to_string() } else { self.terminal().await };
+        match self.send(from, &request.from, &said, Some(request.id.clone()), true, false, Some(signed)).await {
+            Ok(_) => format!(" (Sent to {}, signed.)", request.from),
+            Err(e) => {
+                log(&format!("couldn't send {}'s answer to {}: {e:#}", self.person, request.from));
+                format!(" (Couldn't send it to {}: {e:#}.)", request.from)
+            }
         }
+    }
+
+    /// This person's own session (`<person>/terminal`), registered the way the CLI registers it.
+    async fn terminal(self: &Arc<Self>) -> String {
+        let call = HookCall {
+            agent: "cli".into(),
+            event: "stop".into(),
+            session_id: "terminal".into(),
+            cwd: None,
+            pid: None,
+            mail: false,
+            transcript: None,
+            doing: None,
+            name: Some("terminal".into()),
+        };
+        if let Err(e) = self.hook(call).await {
+            log(&format!("couldn't register {}/terminal: {e:#}", self.person));
+        }
+        "cli:terminal".into()
     }
 
     /// An answer no call waited for any more: to the session, as a message from its person.
@@ -226,7 +263,7 @@ struct Waiting<'a> {
 }
 
 impl Waiting<'_> {
-    fn take(&self) -> Option<Answer> {
+    fn take(&self) -> Option<(Answer, String)> {
         let mut asks = self.daemon.asks.lock().unwrap();
         let up = asks.get_mut(self.key)?;
         up.taken |= up.answer.is_some();
@@ -245,7 +282,7 @@ impl Drop for Waiting<'_> {
         let up = asks.remove(self.key).expect("just looked up");
         drop(asks);
         if !up.taken
-            && let Some(answer) = up.answer
+            && let Some((answer, _)) = up.answer
         {
             self.daemon.answer_later(self.key, &up.question, &answer);
         }
@@ -314,17 +351,25 @@ function run([title, question, secs, icon]) {
 
 #[cfg(target_os = "macos")]
 fn dialog(title: &str, question: &str) -> Option<Command> {
-    let mut cmd = Command::new(crate::agent::find_bin("osascript")?);
+    let mut cmd = Command::new(asker_bin("osascript", &["/usr/bin/osascript"])?);
     let icon = icon().map(|p| p.display().to_string()).unwrap_or_default();
-    cmd.args(["-l", "JavaScript", "-e", PANEL, title, &clip(question), &OPEN_SECS.to_string(), &icon]);
+    cmd.args(["-l", "JavaScript", "-e", PANEL, title, &clip(question, 900), &OPEN_SECS.to_string(), &icon]);
     Some(cmd)
 }
 
-/// What a panel shows of a question: as much as fits, marked where it is cut.
-#[cfg(any(target_os = "macos", windows))]
-fn clip(question: &str) -> String {
-    let q = util::printable(question).trim().to_string();
-    if q.chars().count() <= 900 { q } else { format!("{}…", q.chars().take(900).collect::<String>().trim_end()) }
+/// At most `max` characters of `text`, marked where it is cut.
+fn clip(text: &str, max: usize) -> String {
+    let t = util::printable(text).trim().to_string();
+    if t.chars().count() <= max { t } else { format!("{}…", t.chars().take(max).collect::<String>().trim_end()) }
+}
+
+/// The program that shows the question: in a release build only the system's own, so an agent can't start this machine's
+/// engine with one that answers for its person. (Debug builds take `REASON_NETWORK_<NAME>_BIN`, for tests.)
+fn asker_bin(name: &str, system: &[&str]) -> Option<std::path::PathBuf> {
+    if cfg!(debug_assertions) {
+        return crate::agent::find_bin(name);
+    }
+    system.iter().map(std::path::PathBuf::from).find(|p| p.is_file())
 }
 
 /// Reason's icon for the panel, kept beside the network's database.
@@ -342,8 +387,9 @@ fn icon() -> Option<std::path::PathBuf> {
 /// (`--wait` and `--action` need libnotify 0.7.10, from 2021; with an older one asking fails, and says so.)
 #[cfg(all(unix, not(target_os = "macos")))]
 fn dialog(title: &str, question: &str) -> Option<Command> {
-    use super::notify::{markup, notify_send};
-    let mut cmd = notify_send()?;
+    use super::notify::{markup, notify_send_at};
+    let mut cmd =
+        notify_send_at(asker_bin("notify-send", &["/usr/bin/notify-send", "/run/current-system/sw/bin/notify-send"])?)?;
     cmd.args(["--app-name=Reason Network", "--wait", "--action=approve=Approve", "--action=deny=Deny"])
         .arg(format!("--expire-time={}", OPEN_SECS * 1000))
         .args(["--".into(), markup(title), markup(question)]);
@@ -376,7 +422,8 @@ $no.Add_Click({ $script:choice = "deny`n" + $note.Text; $f.Close() })
 $t = New-Object Windows.Forms.Timer; $t.Interval = [int]$env:TINCAN_SECS * 1000; $t.Add_Tick({ $f.Close() }); $t.Start()
 [Windows.Forms.Application]::Run($f)
 $script:choice"#;
-    let mut cmd = super::notify::powershell(PANEL)?;
-    cmd.env("TINCAN_TITLE", title).env("TINCAN_BODY", clip(question)).env("TINCAN_SECS", OPEN_SECS.to_string());
+    let powershell = asker_bin("powershell", &[r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"])?;
+    let mut cmd = super::notify::powershell_at(powershell, PANEL);
+    cmd.env("TINCAN_TITLE", title).env("TINCAN_BODY", clip(question, 900)).env("TINCAN_SECS", OPEN_SECS.to_string());
     Some(cmd)
 }

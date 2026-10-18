@@ -72,8 +72,10 @@ impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let db = Connection::open(path)?;
         db.execute_batch(SCHEMA)?;
-        // Added in 0.10.7; this fails, harmlessly, once the column is there.
-        let _ = db.execute("ALTER TABLE messages ADD COLUMN approval TEXT", []);
+        // Added in 0.10.7.
+        if !db.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'approval'")?.exists([])? {
+            db.execute("ALTER TABLE messages ADD COLUMN approval TEXT", [])?;
+        }
         Ok(Store { db })
     }
 
