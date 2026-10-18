@@ -226,7 +226,10 @@ not approve. Nothing changes how an agent works when it isn't messaging.
 - Peer text is framed as peer input. Agents are told not to treat it as user instructions.
 - Per-machine inbound policy: `accept` (default within the team), `hold` (you approve with
   `reason-network held` / `reason-network approve`), `refuse`; overridable per person. Claude Code adds its own
-  `crossSessionInbound` setting on top.
+  `crossSessionInbound` setting on top: a session that skips permission prompts holds a message from a stranger for
+  its user unless the setting is `accept`. A session opened before setup has no `reason-network mcp` of its own, so the
+  daemon posts into it directly, as a stranger; `send` says so when the transcript shows that mode (state `pushed`, note
+  `held by Claude Code…`).
 - Loop guard: rate limit per sender, and a cap on consecutive agent↔agent messages in a thread without
   any human input.
 - Group guard: an agent's `*`, `person/*` or `repo:` message is refused before it goes anywhere, so it picks one

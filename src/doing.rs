@@ -156,7 +156,7 @@ fn scan(path: &Path) -> Seen {
 }
 
 /// `~/.claude/projects/<project>/<session>.jsonl`.
-fn claude_transcript(session: &str) -> Option<PathBuf> {
+pub(crate) fn claude_transcript(session: &str) -> Option<PathBuf> {
     static FOUND: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
     let mut found = FOUND.get_or_init(Default::default).lock().unwrap();
     if let Some(p) = found.get(session).filter(|p| p.exists()) {
