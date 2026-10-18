@@ -170,7 +170,7 @@ impl Daemon {
         key: &str,
         request: &Message,
         text: &str,
-        shown: Option<usize>,
+        shown: Option<(usize, usize)>,
         question: &str,
         answer: &Answer,
     ) -> String {
@@ -180,18 +180,20 @@ impl Daemon {
             _ => return String::new(),
         };
         let (Some(team), Ok(said)) = (self.team_state(), self.said(answer)) else { return String::new() };
-        // As much of the request as the person was shown: a panel says how much (after the "<from> asked: " it starts
-        // with); a notification shows what it shows.
-        let seen = match shown {
-            Some(n) => clip(text, n.saturating_sub(format!("{} asked: ", request.from).chars().count())),
-            None => text.to_string(),
+        // As much as the person was shown: a panel says how much of the request (after the "<from> asked: " it starts
+        // with) and of the question; a notification shows what it shows.
+        let (seen, question) = match shown {
+            Some((r, q)) => {
+                (clip(text, r.saturating_sub(format!("{} asked: ", request.from).chars().count())), clip(question, q))
+            }
+            None => (text.to_string(), question.to_string()),
         };
         let approval = Approval {
             about: request.id.clone(),
             asker: request.from.clone(),
             approver: self.person.clone(),
             approved,
-            question: question.to_string(),
+            question,
             request: seen,
             note: clip(note, 500),
             at: util::now_ms(),
@@ -294,14 +296,14 @@ impl Drop for Waiting<'_> {
     }
 }
 
-/// The button on the first line (`approve` or `deny`); from a panel, how much of the request it showed (characters) on
-/// the second, then the note. Anything else is no answer.
-fn parse(out: &str) -> (Answer, Option<usize>) {
-    let mut lines = out.trim().splitn(3, '\n');
+/// The button on the first line (`approve` or `deny`); from a panel, how much of the request and of the question it
+/// showed (characters) on the next two, then the note. Anything else is no answer.
+fn parse(out: &str) -> (Answer, Option<(usize, usize)>) {
+    let mut lines = out.trim().splitn(4, '\n');
     let choice = lines.next().unwrap_or_default().trim().to_lowercase();
-    // A panel (macOS, Windows) that doesn't say how much of the request it showed showed none of it.
-    let shown =
-        cfg!(any(target_os = "macos", windows)).then(|| lines.next().and_then(|l| l.trim().parse().ok()).unwrap_or(0));
+    // A panel (macOS, Windows) that doesn't say how much it showed showed none of it.
+    let mut count = || lines.next().and_then(|l| l.trim().parse().ok()).unwrap_or(0);
+    let shown = cfg!(any(target_os = "macos", windows)).then(|| (count(), count()));
     let note = lines.next().unwrap_or_default().trim().to_string();
     let answer = match choice.as_str() {
         "approve" => Answer::Approved(note),
@@ -314,7 +316,7 @@ fn parse(out: &str) -> (Answer, Option<usize>) {
 /// A floating panel with a note box, Deny (Escape) and Approve (Return). It shows on top without taking the keyboard,
 /// so nothing typed elsewhere reaches it; it gets keys once clicked, in the note box. A teammate's request comes first:
 /// what doesn't fit is cut from the question, and only then from the request. Prints the button, how much of the request
-/// showed (characters), and the note; nothing if it closed unanswered.
+/// and of the question showed (characters), and the note; nothing if it closed unanswered.
 #[cfg(target_os = "macos")]
 const PANEL: &str = r#"ObjC.import("Cocoa")
 function run([title, request, question, secs, icon]) {
@@ -331,12 +333,13 @@ function run([title, request, question, secs, icon]) {
   const cut = (s, n) => s.slice(0, n).join("").trimEnd() + (n < s.length ? "…" : "")
   const text = () => (request ? `${cut(rs, r)}\n\nYour agent asks: ` : "") + cut(qs, q)
   const label = $.NSTextField.wrappingLabelWithString(text())
-  label.preferredMaxLayoutWidth = 330
-  while (label.fittingSize.height > 320 && r + q > 0) {
+  // Measured as it is drawn, in a frame 330 wide.
+  const tall = () => label.cell.cellSizeForBounds($.NSMakeRect(0, 0, 330, 1e7)).height
+  while (tall() > 320 && r + q > 0) {
     if (q > 0) q = Math.max(0, q - 20); else r = Math.max(0, r - 20)
     label.stringValue = text()
   }
-  const h = Math.max(label.fittingSize.height, 48)
+  const h = Math.max(tall(), 48)
   // Titled, non-activating: it doesn't take the keyboard from the app in front.
   const panel = $.NSPanel.alloc.initWithContentRectStyleMaskBackingDefer($.NSMakeRect(0, 0, 440, h + 96), 1 | 128, 2, false)
   panel.title = title
@@ -364,7 +367,7 @@ function run([title, request, question, secs, icon]) {
   panel.orderFrontRegardless
   $.NSTimer.scheduledTimerWithTimeIntervalTargetSelectorUserInfoRepeats(Number(secs), app, "stop:", null, false)
   app.run
-  return answer ? `${answer[0]}\n${r}\n${answer[1]}` : ""
+  return answer ? `${answer[0]}\n${r}\n${q}\n${answer[1]}` : ""
 }"#;
 
 #[cfg(target_os = "macos")]
@@ -427,7 +430,7 @@ fn dialog(title: &str, request: &str, question: &str) -> Option<Command> {
 }
 
 /// The same panel as on macOS: shown on top without taking the keyboard (once clicked into, Return approves and Escape
-/// denies), the request first; prints the button, how much of the request showed, and the note.
+/// denies), the request first; prints the button, how much of the request and of the question showed, and the note.
 #[cfg(windows)]
 fn dialog(title: &str, request: &str, question: &str) -> Option<Command> {
     const PANEL: &str = r#"$ErrorActionPreference = 'Stop'
@@ -441,7 +444,9 @@ $l = New-Object Windows.Forms.FlowLayoutPanel; $l.FlowDirection = 'TopDown'; $l.
 $q = New-Object Windows.Forms.Label; $q.UseMnemonic = $false; $q.UseCompatibleTextRendering = $false; $q.AutoSize = $true; $q.MaximumSize = '420,320'
 $req = [Globalization.StringInfo]::new([string]$env:TINCAN_REQUEST); $ask = [Globalization.StringInfo]::new([string]$env:TINCAN_QUESTION)
 $reqShown = $req.LengthInTextElements; $askShown = $ask.LengthInTextElements
+# Cut and shown by text elements, so a mark stays with its letter; counted in characters, as the engine counts.
 $cut = { param($s, $k) if ($k -ge $s.LengthInTextElements) { $s.String } elseif ($k -le 0) { [string][char]0x2026 } else { $s.SubstringByTextElements(0, $k).TrimEnd() + [char]0x2026 } }
+$chars = { param($s, $k) [string]$t = if ($k -ge $s.LengthInTextElements) { $s.String } elseif ($k -le 0) { '' } else { $s.SubstringByTextElements(0, $k) }; $t.Length - @($t.ToCharArray() | Where-Object { [char]::IsLowSurrogate($_) }).Count }
 $text = { if ($req.String) { (& $cut $req $reqShown) + "`n`nYour agent asks: " + (& $cut $ask $askShown) } else { & $cut $ask $askShown } }
 $q.Text = & $text
 # Measured the way the label lays it out.
@@ -460,7 +465,7 @@ $yes.Add_Click({ $script:choice = 'approve'; $script:said = $note.Text; $f.Close
 $no.Add_Click({ $script:choice = 'deny'; $script:said = $note.Text; $f.Close() })
 $t = New-Object Windows.Forms.Timer; $t.Interval = [int]$env:TINCAN_SECS * 1000; $t.Add_Tick({ $f.Close() }); $t.Start()
 [Windows.Forms.Application]::Run($f)
-if ($script:choice) { "$($script:choice)`n$reqShown`n$($script:said)" }"#;
+if ($script:choice) { "$($script:choice)`n$(& $chars $req $reqShown)`n$(& $chars $ask $askShown)`n$($script:said)" }"#;
     let powershell = asker_bin("powershell", &[r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"])?;
     let mut cmd = super::notify::powershell_at(powershell, PANEL);
     cmd.env("TINCAN_TITLE", title).env("TINCAN_REQUEST", request).env("TINCAN_QUESTION", question);
@@ -482,5 +487,19 @@ mod tests {
         );
         assert_eq!(clip("abcdef", 3), "abc…");
         assert_eq!(clip("abc", 3), "abc");
+    }
+
+    #[test]
+    fn a_panel_says_how_much_it_showed() {
+        let (answer, shown) = parse("approve\n12\n3\nsend it\n");
+        if cfg!(any(target_os = "macos", windows)) {
+            assert!(matches!(answer, Answer::Approved(n) if n == "send it"));
+            assert_eq!(shown, Some((12, 3)));
+            // One that doesn't say showed nothing.
+            assert_eq!(parse("deny\nabc").1, Some((0, 0)));
+        } else {
+            assert!(matches!(parse("approve\n").0, Answer::Approved(n) if n.is_empty()));
+            assert_eq!(shown, None);
+        }
     }
 }
