@@ -68,13 +68,15 @@ pub fn wired() -> bool {
     })
 }
 
-const HELD: &str = "held by Claude Code for its user's approval: the session skips permission prompts and was open before \
-                    Reason Network was set up (restart it and it takes messages straight away)";
+const HELD: &str = "held by Claude Code for its user's approval: the session skips permission prompts and has no \
+                    `reason-network mcp` of its own (restart it, or turn the server on in /mcp, and it takes messages \
+                    straight away)";
 
 /// What to tell the sender of a message posted straight into a Claude Code session, when Claude Code will hold it. A
-/// session open before setup has no `reason-network mcp` of its own to post with its token, so the post reaches it as
-/// a stranger's, and a session that skips permission prompts holds those for its user unless `crossSessionInbound` is
-/// `accept`. `None`: not known to be held (the mode is not in its transcript).
+/// session without a `reason-network mcp` of its own (open before setup, or its server turned off or crashed) can't
+/// post with its own token, so the post reaches it as a stranger's, and a session that skips permission prompts holds
+/// those for its user unless `crossSessionInbound` is `accept`. `None`: not known to be held (the mode is not in its
+/// transcript).
 pub fn held_note(session: Option<&str>) -> Option<&'static str> {
     let mode = permission_mode(&crate::doing::claude_transcript(session?)?)?;
     held_by(&mode, inbound_setting().as_deref()).then_some(HELD)
@@ -84,7 +86,8 @@ fn held_by(mode: &str, setting: Option<&str>) -> bool {
     mode == "bypassPermissions" && setting != Some("accept")
 }
 
-/// `crossSessionInbound` in the user's Claude Code settings, if set.
+/// `crossSessionInbound` in the user's own `settings.json`, if set. Managed settings and a session's `--settings`
+/// take precedence over it and are not read, so a session can differ.
 fn inbound_setting() -> Option<String> {
     let text = std::fs::read_to_string(paths::claude_dir().join("settings.json")).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
