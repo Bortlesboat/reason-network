@@ -99,10 +99,12 @@ pub fn process(pid: u32) -> Option<(u32, String)> {
     }
 }
 
-/// Lowercase letters, digits and single dashes: a name that is safe in an address.
+/// Lowercase letters, digits and single dashes: a name that is safe in an address. Letters of other scripts are
+/// transliterated first (`José` -> `jose`, `代码` -> `dai-ma`), so the address stays plain ASCII, which every version
+/// accepts, and nothing but punctuation comes out empty.
 pub fn slug(s: &str) -> String {
     let mut out = String::new();
-    for c in s.chars() {
+    for c in deunicode::deunicode(s).chars() {
         if c.is_ascii_alphanumeric() {
             out.push(c.to_ascii_lowercase());
         } else if !out.is_empty() && !out.ends_with('-') {
@@ -240,6 +242,37 @@ mod tests {
         assert_eq!(slug("Sams-MacBook-Pro"), "sams-macbook-pro");
         assert_eq!(slug("  my repo (v2)!"), "my-repo-v2");
         assert_eq!(slug("--"), "");
+    }
+
+    #[test]
+    fn slugs_of_other_scripts_are_transliterated() {
+        assert_eq!(slug("José Peña"), "jose-pena");
+        assert_eq!(slug("Müller Straße"), "muller-strasse");
+        assert_eq!(slug("Проверка кода"), "proverka-koda");
+        assert_eq!(slug("代码审查"), "dai-ma-shen-cha");
+        // Mixed with ASCII, the ASCII part stays where it was.
+        assert_eq!(slug("api 审查"), "api-shen-cha");
+        // Scripts that used to come out empty or cut to a letter now give a usable address.
+        for name in [
+            "コードレビュー",
+            "코드 리뷰",
+            "مراجعة الكود",
+            "בדיקת קוד",
+            "कोड समीक्षा",
+            "ตรวจโค้ด",
+            "Έλεγχος",
+            "Łódź żółć",
+        ] {
+            let s = slug(name);
+            assert!(
+                s.len() > 2 && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+                "{name}: {s:?}"
+            );
+            assert_eq!(slug(&s), s, "{name}: slugging again changes nothing");
+        }
+        // What was already a slug stays one, so names saved by an older version don't change.
+        assert_eq!(slug("sams-macbook-pro"), "sams-macbook-pro");
+        assert_eq!(slug("v2"), "v2");
     }
 
     #[test]
