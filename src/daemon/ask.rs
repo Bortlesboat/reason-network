@@ -220,7 +220,9 @@ function run([title, question, secs, icon]) {
   const answer = $.Answer.alloc.init
   const label = $.NSTextField.wrappingLabelWithString(question)
   label.preferredMaxLayoutWidth = 330
-  const h = Math.min(Math.max(label.fittingSize.height, 48), 320)
+  // A question too long to show whole ends in "…" where the panel cuts it.
+  for (let n = question.length; label.fittingSize.height > 320 && n > 0; n -= 20) label.stringValue = question.slice(0, n).trimEnd() + "…"
+  const h = Math.max(label.fittingSize.height, 48)
   // Titled, non-activating: it doesn't take the keyboard from the app in front.
   const panel = $.NSPanel.alloc.initWithContentRectStyleMaskBackingDefer($.NSMakeRect(0, 0, 440, h + 96), 1 | 128, 2, false)
   panel.title = title
@@ -302,6 +304,8 @@ $f.Text = $env:TINCAN_TITLE; $f.TopMost = $true; $f.StartPosition = 'CenterScree
 $f.MinimizeBox = $false; $f.MaximizeBox = $false; $f.AutoSize = $true; $f.AutoSizeMode = 'GrowAndShrink'; $f.Padding = 12
 $l = New-Object Windows.Forms.FlowLayoutPanel; $l.FlowDirection = 'TopDown'; $l.AutoSize = $true
 $q = New-Object Windows.Forms.Label; $q.UseMnemonic = $false; $q.Text = $env:TINCAN_BODY; $q.AutoSize = $true; $q.MaximumSize = '420,320'
+# A question too long to show whole ends in "…" where the panel cuts it.
+$s = $q.Text; while ([Windows.Forms.TextRenderer]::MeasureText($q.Text, $q.Font, '420,0', 'WordBreak').Height -gt 320) { $s = $s.Substring(0, $s.Length - 20).TrimEnd(); $q.Text = $s + [char]0x2026 }
 $note = New-Object Windows.Forms.TextBox; $note.Width = 420
 $b = New-Object Windows.Forms.FlowLayoutPanel; $b.FlowDirection = 'RightToLeft'; $b.Width = 420; $b.Height = 34
 $yes = New-Object Windows.Forms.Button; $yes.Text = 'Approve'; $no = New-Object Windows.Forms.Button; $no.Text = 'Deny'
