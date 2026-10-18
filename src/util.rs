@@ -101,12 +101,16 @@ pub fn process(pid: u32) -> Option<(u32, String)> {
 
 /// Lowercase letters, digits and single dashes: a name that is safe in an address. Letters of other scripts are
 /// transliterated first (`José` -> `jose`, `代码` -> `dai-ma`), so the address stays plain ASCII, which every version
-/// accepts, and nothing but punctuation comes out empty. A character it can't transliterate is a separator.
+/// accepts. A character it can't transliterate (unassigned, private use) is a separator, like punctuation and control
+/// characters, so only a name without a letter or digit in any script it knows comes out empty.
 pub fn slug(s: &str) -> String {
     let mut out = String::new();
     // One character at a time, so a long name (teammates' names arrive up to megabytes long) costs no more than what is
-    // kept: one character can become up to 41.
-    for c in s.chars().flat_map(|c| deunicode::deunicode_char(c).unwrap_or(" ").chars()) {
+    // kept: one character can become up to 41. (deunicode maps control characters to nothing, which would run the
+    // words on either side together, so they are told apart first.)
+    for c in
+        s.chars().flat_map(|c| if c.is_control() { " " } else { deunicode::deunicode_char(c).unwrap_or(" ") }.chars())
+    {
         if out.len() > 40 {
             break;
         }
@@ -247,6 +251,10 @@ mod tests {
         assert_eq!(slug("Sams-MacBook-Pro"), "sams-macbook-pro");
         assert_eq!(slug("  my repo (v2)!"), "my-repo-v2");
         assert_eq!(slug("--"), "");
+        // Control characters separate words like any other punctuation (a folder name or `--as` can carry them).
+        assert_eq!(slug("Code\tre\nview"), "code-re-view");
+        assert_eq!(slug("line one\r\nline two"), "line-one-line-two");
+        assert_eq!(slug("a\u{85}b\u{1b}c"), "a-b-c");
     }
 
     #[test]
