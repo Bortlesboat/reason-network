@@ -65,8 +65,8 @@ pub struct SendArgs {
 pub struct AskArgs {
     /// What they need to decide: who asks for what, and why.
     pub question: String,
-    /// The id of the teammate's message you're asking about: your user sees it in the pop-up, and its sender gets
-    /// the answer signed by this machine.
+    /// When it's about a teammate's message, its id (the `id="…"` of their `<reason-message>`): your user sees that
+    /// request in the pop-up, and its sender gets the answer signed by this machine.
     #[serde(default)]
     pub about: Option<String>,
 }
