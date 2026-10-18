@@ -99,10 +99,21 @@ pub fn process(pid: u32) -> Option<(u32, String)> {
     }
 }
 
-/// Lowercase letters, digits and single dashes: a name that is safe in an address.
+/// Lowercase letters, digits and single dashes: a name that is safe in an address. Letters of other scripts are
+/// transliterated first (`José` -> `jose`, `代码` -> `dai-ma`), so the address stays plain ASCII, which every version
+/// accepts. A character it can't transliterate (unassigned, private use) is a separator, like punctuation and control
+/// characters, so only a name without a letter or digit in any script it knows comes out empty.
 pub fn slug(s: &str) -> String {
     let mut out = String::new();
-    for c in s.chars() {
+    // One character at a time, so a long name (teammates' names arrive up to megabytes long) costs no more than what is
+    // kept: one character can become up to 41. (deunicode maps control characters to nothing, which would run the
+    // words on either side together, so they are told apart first.)
+    for c in
+        s.chars().flat_map(|c| if c.is_control() { " " } else { deunicode::deunicode_char(c).unwrap_or(" ") }.chars())
+    {
+        if out.len() > 40 {
+            break;
+        }
         if c.is_ascii_alphanumeric() {
             out.push(c.to_ascii_lowercase());
         } else if !out.is_empty() && !out.ends_with('-') {
@@ -240,6 +251,56 @@ mod tests {
         assert_eq!(slug("Sams-MacBook-Pro"), "sams-macbook-pro");
         assert_eq!(slug("  my repo (v2)!"), "my-repo-v2");
         assert_eq!(slug("--"), "");
+        // Control characters separate words like any other punctuation (a folder name or `--as` can carry them).
+        assert_eq!(slug("Code\tre\nview"), "code-re-view");
+        assert_eq!(slug("line one\r\nline two"), "line-one-line-two");
+        assert_eq!(slug("a\u{85}b\u{1b}c"), "a-b-c");
+    }
+
+    #[test]
+    fn slugs_of_other_scripts_are_transliterated() {
+        assert_eq!(slug("José Peña"), "jose-pena");
+        assert_eq!(slug("Müller Straße"), "muller-strasse");
+        assert_eq!(slug("Проверка кода"), "proverka-koda");
+        assert_eq!(slug("代码审查"), "dai-ma-shen-cha");
+        // Mixed with ASCII, the ASCII part stays where it was.
+        assert_eq!(slug("api 审查"), "api-shen-cha");
+        // Scripts that used to come out empty or cut to a letter now give a usable address.
+        for name in [
+            "コードレビュー",
+            "코드 리뷰",
+            "مراجعة الكود",
+            "בדיקת קוד",
+            "कोड समीक्षा",
+            "ตรวจโค้ด",
+            "Έλεγχος",
+            "Łódź żółć",
+        ] {
+            let s = slug(name);
+            assert!(
+                s.len() > 2 && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+                "{name}: {s:?}"
+            );
+            assert_eq!(slug(&s), s, "{name}: slugging again changes nothing");
+        }
+        // What was already a slug stays one, so names saved by an older version don't change.
+        assert_eq!(slug("sams-macbook-pro"), "sams-macbook-pro");
+        assert_eq!(slug("v2"), "v2");
+        // Only symbols: still empty, however they are written.
+        assert_eq!(slug("!@#$%^&*()"), "");
+        assert_eq!(slug("“—…”"), "");
+    }
+
+    #[test]
+    fn a_long_name_of_wide_characters_costs_what_is_kept() {
+        // Teammates' names arrive through `slug` too, and one character can become many letters.
+        let started = std::time::Instant::now();
+        let s = slug(&"龘".repeat(1 << 20));
+        assert_eq!(s.len(), 40, "{s}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "slowed by input it never keeps");
+        // The cut is the same as slugging everything first.
+        let long = "api ".repeat(100);
+        assert_eq!(slug(&long), long.trim().replace(' ', "-").chars().take(40).collect::<String>());
     }
 
     #[test]

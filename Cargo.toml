@@ -17,6 +17,7 @@ blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 cliclack = "0.5"
 data-encoding = "2"
+deunicode = { version = "=1.6.2", default-features = false }
 futures-lite = "2"
 getrandom = "0.3"
 iroh = "1.3"
