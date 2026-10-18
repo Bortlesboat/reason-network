@@ -192,13 +192,27 @@ Three tools, none of which an agent has to call unless it wants to message someo
   a machine without a desktop says so. With `notify`, `to` may be your own user: then only the pop-up, on each of
   your machines that is on (an agent that needs its user).
 - `check_inbox(wait_secs?)`: unread messages; can block waiting for a reply.
-- `ask_user(question)`: asks the session's own person with a pop-up on its machine and waits (up to 10 minutes) for
-  Approve or Deny, with a note: on macOS and Windows a floating panel that doesn't take the keyboard (Return approves
-  once it is clicked into, Escape denies), on Linux a notification with buttons (no note; libnotify 0.7.10+). The
-  answer is the tool's result, not a message: only the pop-up on that machine gives it. One question per session is up
-  at a time (asking it again waits for it, another is refused until then); it stays up an hour, and an answer after
-  the call gave up comes as an ordinary message from `<person>/terminal`. No desktop: an error, so the agent asks in
-  its own session.
+- `ask_user(question, about?)`: asks the session's own person with a pop-up on its machine and waits (up to 10
+  minutes) for Approve or Deny, with a note: on macOS and Windows a floating panel that doesn't take the keyboard
+  (Return approves once it is clicked into, Escape denies), on Linux a notification with buttons (no note; libnotify
+  0.7.10+). The answer is the tool's result, not a message: only the pop-up on that machine gives it. One question per
+  session is up at a time (asking it again waits for it, another is refused until then); it stays up an hour, and an
+  answer after the call gave up comes as an ordinary message from `<person>/terminal`. No desktop: an error, so the
+  agent asks in its own session. With `about` (the id of a teammate's message to this session), the pop-up shows that
+  request first, in its sender's words (up to 500 characters, marked where cut), then the agent's question in the room
+  left (a panel cuts the question first and the request only after it, and says how much of each it showed; a Linux
+  notification shows what its server shows; direction overrides and invisible characters are left out of what's shown
+  and signed, though glyphs drawn over each other can still hide text the panel laid out); the answer also goes to the
+  request's sender, from the asking session or the person's terminal if it has gone, as an `Approval` holding what was
+  shown (the request's id and sender, the approver, the decision, the request, the question, the note, the time),
+  signed with this machine's key like the team's own entries. The receiving machine keeps it only if the machine that
+  sent it signed it, as its own person, for the session it arrived at; anything else is dropped, and the message says
+  it didn't verify. Which request it answers is the approver's machine's word, so agents see `<reason-approval from=…
+  about=… verified>` and check `from` is the person they asked and `about` their request; older machines see the plain
+  text. It proves the approver's machine recorded its person's answer: an agent can't write one, and release builds
+  use only the system's own dialog programs, which keeps an agent from simply starting the engine with a stand-in that
+  answers. That is a speed bump, not a guarantee: software that controls the approver's machine can still sign (the
+  machine's key is a file there, and it could build its own engine).
 
 Agents never report what they are doing; Reason Network reads it from what they record anyway (`doing.rs`): the
 session's title (Claude Code's `ai-title` transcript entries, Codex's thread names in

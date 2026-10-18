@@ -5,7 +5,7 @@
 //! don't show them a second time.
 
 use super::{Daemon, Inner, directory::Target, log};
-use crate::{agent, claude, config::Policy, proto::*, render, util};
+use crate::{agent, claude, config::Policy, proto::*, render, team::Signed, util};
 use anyhow::{Result, anyhow, bail};
 use iroh::EndpointId;
 use std::{
@@ -71,6 +71,7 @@ const LOOP_NOTE: &str = "refused: these two agents have exchanged a lot of messa
                          looks like a loop. Check with your user before continuing.";
 
 impl Daemon {
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn send(
         self: &Arc<Self>,
         from: String,
@@ -79,6 +80,7 @@ impl Daemon {
         reply_to: Option<String>,
         wake: bool,
         notify: bool,
+        approval: Option<Box<Signed<Approval>>>,
     ) -> Result<SendResult> {
         let (body, to) = (body.trim(), to.trim());
         if body.is_empty() {
@@ -134,6 +136,7 @@ impl Daemon {
                     wake: false,
                     notify: true,
                     sent_at: now,
+                    approval: None,
                 };
                 let (sent, note) = self.notify(&msg);
                 let state = if sent { "notified" } else { "not notified" };
@@ -167,6 +170,7 @@ impl Daemon {
                     wake,
                     notify,
                     sent_at: now,
+                    approval: approval.clone(),
                 };
                 res.ids.push(msg.id.clone());
                 let here = !matches!(t, Target::Remote { .. });
@@ -419,7 +423,7 @@ impl Daemon {
             .team_state()
             .and_then(|t| t.member(&peer).map(|m| m.person.clone()))
             .ok_or_else(|| anyhow!("not a team member"))?;
-        let msg = clean(msg)?;
+        let mut msg = clean(msg)?;
         // Messages go between agent sessions (or, with notify, to a person's screen); an older Reason Network may still send
         // to or from a person.
         if !msg.from.contains('/') || (!msg.to.contains('/') && !msg.notify) {
@@ -428,6 +432,12 @@ impl Daemon {
         // A machine speaks only for its own agents.
         if !msg.from.starts_with(&format!("{sender}/")) {
             bail!("{} cannot send as {}", sender, msg.from);
+        }
+        if let Some(a) = &msg.approval
+            && !self.team_state().is_some_and(|t| approval_holds(a, t.name(), &peer, &sender, &msg.to))
+        {
+            msg.approval = None;
+            msg.body.push_str("\n\n(It came with an approval that didn't verify.)");
         }
         let policy = self.cfg.policy_for(&sender);
         if policy == Policy::Refuse {
@@ -592,6 +602,15 @@ fn tidy(s: &str, extra: &str, max: usize) -> Option<String> {
     (!t.is_empty()).then_some(t)
 }
 
+/// Whether an approval that came from `peer` (a machine of `sender`'s) to the session `to` stands: signed by that machine
+/// for this team, as its own person's answer, for that session, and of a sane size (in characters, as the sender cuts
+/// it). Which request it answers is the approver's machine's word: the frame shows `about`, for the agent to check.
+fn approval_holds(a: &Signed<Approval>, team: &str, peer: &EndpointId, sender: &str, to: &str) -> bool {
+    let b = &a.body;
+    let size: usize = [&b.about, &b.asker, &b.question, &b.request, &b.note].iter().map(|s| s.chars().count()).sum();
+    size <= 2000 && a.by == *peer && b.approver == sender && b.asker == to && a.verify(team, "approval")
+}
+
 /// Validates a message from a peer and strips its metadata down to safe characters.
 fn clean(m: Message) -> Result<Message> {
     let ok = |s: &str, extra: &str| {
@@ -623,4 +642,48 @@ where
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iroh::SecretKey;
+
+    fn approval(asker: &str, approver: &str) -> Approval {
+        Approval {
+            about: "01REQ".into(),
+            asker: asker.into(),
+            approver: approver.into(),
+            approved: true,
+            question: "Rename it?".into(),
+            request: "please rename billing".into(),
+            note: String::new(),
+            at: 1,
+        }
+    }
+
+    #[test]
+    fn an_approval_stands_only_from_its_approvers_machine_to_the_session_that_asked() {
+        let (bob, mallory) = (SecretKey::generate(), SecretKey::generate());
+        let real = Signed::new(approval("alice/api", "bob"), &bob, "acme", "approval");
+        assert!(approval_holds(&real, "acme", &bob.public(), "bob", "alice/api"));
+        // Passed on by another machine; claimed for bob by another person's machine; to another session; another team.
+        assert!(!approval_holds(&real, "acme", &mallory.public(), "mallory", "alice/api"));
+        let claimed = Signed::new(approval("alice/api", "bob"), &mallory, "acme", "approval");
+        assert!(!approval_holds(&claimed, "acme", &mallory.public(), "mallory", "alice/api"));
+        assert!(!approval_holds(&real, "acme", &bob.public(), "bob", "alice/other"));
+        assert!(!approval_holds(&real, "other", &bob.public(), "bob", "alice/api"));
+        // Changed after it was signed, or too big.
+        let mut changed = real.clone();
+        changed.body.approved = false;
+        assert!(!approval_holds(&changed, "acme", &bob.public(), "bob", "alice/api"));
+        // A full-size answer in any script stands; one bigger than the sender would make doesn't.
+        let mut cjk = approval("alice/api", "bob");
+        (cjk.request, cjk.question, cjk.note) = ("请".repeat(501), "吗".repeat(401), "好".repeat(500));
+        assert!(approval_holds(&Signed::new(cjk, &bob, "acme", "approval"), "acme", &bob.public(), "bob", "alice/api"));
+        let mut big = approval("alice/api", "bob");
+        big.note = "x".repeat(3000);
+        let big = Signed::new(big, &bob, "acme", "approval");
+        assert!(!approval_holds(&big, "acme", &bob.public(), "bob", "alice/api"));
+    }
 }

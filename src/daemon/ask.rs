@@ -3,7 +3,11 @@
 //! with buttons on Linux.
 
 use super::{Daemon, MAX_WAIT, log, mail::unregistered};
-use crate::{proto::Message, util};
+use crate::{
+    proto::{Approval, HookCall, Message},
+    team::Signed,
+    util,
+};
 use anyhow::{Result, anyhow, bail};
 use std::{process::Command, sync::Arc, time::Duration};
 use ulid::Ulid;
@@ -27,7 +31,8 @@ pub(super) struct Asking {
     question: String,
     /// Calls waiting for its answer now.
     waiting: usize,
-    answer: Option<Answer>,
+    /// The answer, and what to add to it for the asking agent (whether a signed answer went to a teammate).
+    answer: Option<(Answer, String)>,
     /// Whether a waiting call has returned the answer.
     taken: bool,
 }
@@ -35,33 +40,53 @@ pub(super) struct Asking {
 impl Daemon {
     /// Asks this machine's person on behalf of the session `key`, and waits for the answer. A session has one
     /// question up at a time: asking it again waits for it, asking another is refused until it is answered. An answer
-    /// that comes once no call waits for it reaches the session as a message from its person.
-    pub(super) async fn ask(self: &Arc<Self>, key: String, question: String) -> Result<String> {
-        let (asker, stop) = {
+    /// that comes once no call waits for it reaches the session as a message from its person. `about`, a teammate's
+    /// message to this session, is shown with the question, and its sender gets the answer signed by this machine.
+    pub(super) async fn ask(self: &Arc<Self>, key: String, question: String, about: Option<String>) -> Result<String> {
+        let (asker, stop, request) = {
             let g = self.inner.lock().unwrap();
             let l = g.live.get(&key).ok_or_else(unregistered)?;
-            (self.addr(&l.name), l.stop_gen)
+            let asker = self.addr(&l.name);
+            let request = match about {
+                Some(id) => Some(
+                    g.store
+                        .message(&id)?
+                        .filter(|m| m.to == asker && !m.from.starts_with(&format!("{}/", self.person)))
+                        .ok_or_else(|| anyhow!("no message {id} from a teammate to this session"))?,
+                ),
+                None => None,
+            };
+            (asker, l.stop_gen, request)
         };
+        // A teammate's request comes first, in their words (cut only where it ends in "…"), and the agent's question gets
+        // the room left: the request the person sees is the one the signed answer says they saw.
+        let request = request.map(|m| {
+            let text = clip(&plain(&util::one_line(&m.body, 2000)), 500);
+            (m, text)
+        });
+        let question = clip(&plain(&question), if request.is_some() { 400 } else { 900 });
+        let asked = request.as_ref().map_or(String::new(), |(m, text)| format!("{} asked: {text}", m.from));
+        let popup = if asked.is_empty() { question.clone() } else { format!("{asked}\n\nYour agent asks: {question}") };
         {
             let mut asks = self.asks.lock().unwrap();
             match asks.get_mut(&key) {
-                Some(up) if up.question != question => bail!(
+                Some(up) if up.question != popup => bail!(
                     "your question \"{}\" is still up for {}: ask it again to keep waiting for its answer",
                     util::one_line(&up.question, 200),
                     self.person
                 ),
                 Some(up) => up.waiting += 1,
                 None => {
-                    let cmd = dialog(&format!("{asker} asks"), &question).ok_or_else(|| {
+                    let cmd = dialog(&format!("{asker} asks"), &asked, &question).ok_or_else(|| {
                         anyhow!(
                             "{} has no screen to ask {} on: ask them in your own session",
                             self.machine,
                             self.person
                         )
                     })?;
-                    let up = Asking { question: question.clone(), waiting: 1, answer: None, taken: false };
+                    let up = Asking { question: popup, waiting: 1, answer: None, taken: false };
                     asks.insert(key.clone(), up);
-                    tokio::spawn(self.clone().pop_up(key.clone(), question, cmd));
+                    tokio::spawn(self.clone().pop_up(key.clone(), question, request, cmd));
                 }
             }
         }
@@ -73,8 +98,8 @@ impl Daemon {
             let woke = self.arrived.notified();
             tokio::pin!(woke);
             woke.as_mut().enable();
-            if let Some(answer) = waiting.take() {
-                return self.said(&answer);
+            if let Some((answer, receipt)) = waiting.take() {
+                return Ok(format!("{}{receipt}", self.said(&answer)?));
             }
             let gave_up = self.inner.lock().unwrap().live.get(&key).is_none_or(|l| l.stop_gen != stop);
             if gave_up || tokio::time::Instant::now() >= deadline {
@@ -101,30 +126,107 @@ impl Daemon {
         })
     }
 
-    /// Shows the question until it is answered or closes, then hands the answer to the calls waiting for it.
-    async fn pop_up(self: Arc<Self>, key: String, question: String, cmd: Command) {
+    /// Shows the question until it is answered or closes, then hands the answer to the calls waiting for it (and, for
+    /// a teammate's request, to its sender).
+    async fn pop_up(self: Arc<Self>, key: String, question: String, request: Option<(Message, String)>, cmd: Command) {
         let mut cmd = tokio::process::Command::from(cmd);
         let out = tokio::time::timeout(Duration::from_secs(OPEN_SECS + 60), cmd.kill_on_drop(true).output()).await;
-        let answer = match out {
+        let (answer, shown) = match out {
             Ok(Ok(o)) if o.status.success() => parse(&String::from_utf8_lossy(&o.stdout)),
-            Ok(Ok(o)) => Answer::Failed(String::from_utf8_lossy(&o.stderr).trim().to_string()),
-            Ok(Err(e)) => Answer::Failed(e.to_string()),
-            Err(_) => Answer::Unanswered,
+            Ok(Ok(o)) => (Answer::Failed(String::from_utf8_lossy(&o.stderr).trim().to_string()), None),
+            Ok(Err(e)) => (Answer::Failed(e.to_string()), None),
+            Err(_) => (Answer::Unanswered, None),
         };
         if let Answer::Failed(e) = &answer {
             log(&format!("pop-up failed: {e}"));
         }
-        let mut asks = self.asks.lock().unwrap();
-        let Some(up) = asks.get_mut(&key) else { return };
-        if up.waiting > 0 {
-            up.answer = Some(answer);
-            drop(asks);
+        // The teammate's answer goes first, so the calls waiting can say whether it went.
+        let receipt = match &request {
+            Some((m, text)) => self.send_approval(&key, m, text, shown, &question, &answer).await,
+            None => String::new(),
+        };
+        let waited = {
+            let mut asks = self.asks.lock().unwrap();
+            let Some(up) = asks.get_mut(&key) else { return };
+            let waited = up.waiting > 0;
+            if waited {
+                up.answer = Some((answer.clone(), receipt));
+            } else {
+                asks.remove(&key);
+            }
+            waited
+        };
+        if waited {
             self.arrived.notify_waiters();
         } else {
-            asks.remove(&key);
-            drop(asks);
             self.answer_later(&key, &question, &answer);
         }
+    }
+
+    /// The person's answer to a teammate's request, with what they saw, signed by this machine, to the session that sent
+    /// the request: from the asking session, or this person's terminal if that has gone. Says whether it went.
+    async fn send_approval(
+        self: &Arc<Self>,
+        key: &str,
+        request: &Message,
+        text: &str,
+        shown: Option<(usize, usize)>,
+        question: &str,
+        answer: &Answer,
+    ) -> String {
+        let (approved, note) = match answer {
+            Answer::Approved(n) => (true, n),
+            Answer::Denied(n) => (false, n),
+            _ => return String::new(),
+        };
+        let (Some(team), Ok(said)) = (self.team_state(), self.said(answer)) else { return String::new() };
+        // As much as the person was shown: a panel says how much of the request (after the "<from> asked: " it starts
+        // with) and of the question; a notification shows what it shows.
+        let (seen, question) = match shown {
+            Some((r, q)) => {
+                (clip(text, r.saturating_sub(format!("{} asked: ", request.from).chars().count())), clip(question, q))
+            }
+            None => (text.to_string(), question.to_string()),
+        };
+        let approval = Approval {
+            about: request.id.clone(),
+            asker: request.from.clone(),
+            approver: self.person.clone(),
+            approved,
+            question,
+            request: seen,
+            note: clip(note, 500),
+            at: util::now_ms(),
+        };
+        let signed = Box::new(Signed::new(approval, &self.key, team.name(), "approval"));
+        let live = self.inner.lock().unwrap().live.contains_key(key);
+        let from = if live { key.to_string() } else { self.terminal().await };
+        match self.send(from, &request.from, &said, Some(request.id.clone()), true, false, Some(signed)).await {
+            Ok(_) => format!(" (Sent to {}, signed.)", request.from),
+            Err(e) => {
+                log(&format!("couldn't send {}'s answer to {}: {e:#}", self.person, request.from));
+                format!(" (Couldn't send it to {}: {e:#}.)", request.from)
+            }
+        }
+    }
+
+    /// This person's own session (`<person>/terminal`), registered the way the CLI registers it.
+    async fn terminal(self: &Arc<Self>) -> String {
+        let call = HookCall {
+            agent: "cli".into(),
+            event: "stop".into(),
+            session_id: "terminal".into(),
+            cwd: None,
+            pid: None,
+            mail: false,
+            transcript: None,
+            doing: None,
+            name: Some("terminal".into()),
+        };
+        if let Err(e) = self.hook(call).await {
+            log(&format!("couldn't register {}/terminal: {e:#}", self.person));
+        }
+        "cli:terminal".into()
     }
 
     /// An answer no call waited for any more: to the session, as a message from its person.
@@ -149,6 +251,7 @@ impl Daemon {
             wake: true,
             notify: false,
             sent_at: util::now_ms(),
+            approval: None,
         };
         if let Err(e) = g.store.insert(&msg, false) {
             return log(&format!("couldn't keep a late answer: {e}"));
@@ -167,7 +270,7 @@ struct Waiting<'a> {
 }
 
 impl Waiting<'_> {
-    fn take(&self) -> Option<Answer> {
+    fn take(&self) -> Option<(Answer, String)> {
         let mut asks = self.daemon.asks.lock().unwrap();
         let up = asks.get_mut(self.key)?;
         up.taken |= up.answer.is_some();
@@ -186,43 +289,57 @@ impl Drop for Waiting<'_> {
         let up = asks.remove(self.key).expect("just looked up");
         drop(asks);
         if !up.taken
-            && let Some(answer) = up.answer
+            && let Some((answer, _)) = up.answer
         {
             self.daemon.answer_later(self.key, &up.question, &answer);
         }
     }
 }
 
-/// `approve` or `deny` on the first line, the note after it; anything else is no answer.
-fn parse(out: &str) -> Answer {
-    let (choice, note) = out.trim().split_once('\n').unwrap_or((out.trim(), ""));
-    let note = note.trim().to_string();
-    match choice.trim().to_lowercase().as_str() {
+/// The button on the first line (`approve` or `deny`); from a panel, how much of the request and of the question it
+/// showed (characters) on the next two, then the note. Anything else is no answer.
+fn parse(out: &str) -> (Answer, Option<(usize, usize)>) {
+    let mut lines = out.trim().splitn(4, '\n');
+    let choice = lines.next().unwrap_or_default().trim().to_lowercase();
+    // A panel (macOS, Windows) that doesn't say how much it showed showed none of it.
+    let mut count = || lines.next().and_then(|l| l.trim().parse().ok()).unwrap_or(0);
+    let shown = cfg!(any(target_os = "macos", windows)).then(|| (count(), count()));
+    let note = lines.next().unwrap_or_default().trim().to_string();
+    let answer = match choice.as_str() {
         "approve" => Answer::Approved(note),
         "deny" => Answer::Denied(note),
         _ => Answer::Unanswered,
-    }
+    };
+    (answer, shown)
 }
 
 /// A floating panel with a note box, Deny (Escape) and Approve (Return). It shows on top without taking the keyboard,
-/// so nothing typed elsewhere reaches it; it gets keys once clicked, in the note box. Prints the button and the note;
-/// nothing if it closed unanswered.
+/// so nothing typed elsewhere reaches it; it gets keys once clicked, in the note box. A teammate's request comes first:
+/// what doesn't fit is cut from the question, and only then from the request. Prints the button, how much of the request
+/// and of the question showed (characters), and the note; nothing if it closed unanswered.
 #[cfg(target_os = "macos")]
 const PANEL: &str = r#"ObjC.import("Cocoa")
-function run([title, question, secs, icon]) {
+function run([title, request, question, secs, icon]) {
   const app = $.NSApplication.sharedApplication
   app.setActivationPolicy($.NSApplicationActivationPolicyAccessory)
-  let choice = ""
+  let answer = null
   ObjC.registerSubclass({ name: "Answer", methods: {
-    "approve:": { types: ["void", ["id"]], implementation: () => { choice = `approve\n${note.stringValue.js}`; app.stop(null) } },
-    "deny:": { types: ["void", ["id"]], implementation: () => { choice = `deny\n${note.stringValue.js}`; app.stop(null) } },
+    "approve:": { types: ["void", ["id"]], implementation: () => { answer = ["approve", note.stringValue.js]; app.stop(null) } },
+    "deny:": { types: ["void", ["id"]], implementation: () => { answer = ["deny", note.stringValue.js]; app.stop(null) } },
   } })
-  const answer = $.Answer.alloc.init
-  const label = $.NSTextField.wrappingLabelWithString(question)
-  label.preferredMaxLayoutWidth = 330
-  // A question too long to show whole ends in "…" where the panel cuts it.
-  for (let n = question.length; label.fittingSize.height > 320 && n > 0; n -= 20) label.stringValue = question.slice(0, n).trimEnd() + "…"
-  const h = Math.max(label.fittingSize.height, 48)
+  const target = $.Answer.alloc.init
+  const [rs, qs] = [Array.from(request), Array.from(question)]
+  let [r, q] = [rs.length, qs.length]
+  const cut = (s, n) => s.slice(0, n).join("").trimEnd() + (n < s.length ? "…" : "")
+  const text = () => (request ? `${cut(rs, r)}\n\nYour agent asks: ` : "") + cut(qs, q)
+  const label = $.NSTextField.wrappingLabelWithString(text())
+  // Measured as it is drawn, in a frame 330 wide.
+  const tall = () => label.cell.cellSizeForBounds($.NSMakeRect(0, 0, 330, 1e7)).height
+  while (tall() > 320 && r + q > 0) {
+    if (q > 0) q = Math.max(0, q - 20); else r = Math.max(0, r - 20)
+    label.stringValue = text()
+  }
+  const h = Math.max(tall(), 48)
   // Titled, non-activating: it doesn't take the keyboard from the app in front.
   const panel = $.NSPanel.alloc.initWithContentRectStyleMaskBackingDefer($.NSMakeRect(0, 0, 440, h + 96), 1 | 128, 2, false)
   panel.title = title
@@ -235,12 +352,12 @@ function run([title, question, secs, icon]) {
   if (image && !image.isNil()) put($.NSImageView.imageViewWithImage(image), 20, h + 28, 48, 48)
   const note = $.NSTextField.alloc.init
   note.placeholderString = "Note (optional)"
-  note.target = answer
+  note.target = target
   note.action = "approve:"
   put(note, 86, 48, 330, 24)
   panel.initialFirstResponder = note
   const button = (name, x, action, key) => {
-    const b = $.NSButton.buttonWithTitleTargetAction(name, answer, action)
+    const b = $.NSButton.buttonWithTitleTargetAction(name, target, action)
     b.keyEquivalent = key
     put(b, x, 10, 96, 30)
   }
@@ -250,22 +367,40 @@ function run([title, question, secs, icon]) {
   panel.orderFrontRegardless
   $.NSTimer.scheduledTimerWithTimeIntervalTargetSelectorUserInfoRepeats(Number(secs), app, "stop:", null, false)
   app.run
-  return choice
+  return answer ? `${answer[0]}\n${r}\n${q}\n${answer[1]}` : ""
 }"#;
 
 #[cfg(target_os = "macos")]
-fn dialog(title: &str, question: &str) -> Option<Command> {
-    let mut cmd = Command::new(crate::agent::find_bin("osascript")?);
+fn dialog(title: &str, request: &str, question: &str) -> Option<Command> {
+    let mut cmd = Command::new(asker_bin("osascript", &["/usr/bin/osascript"])?);
     let icon = icon().map(|p| p.display().to_string()).unwrap_or_default();
-    cmd.args(["-l", "JavaScript", "-e", PANEL, title, &clip(question), &OPEN_SECS.to_string(), &icon]);
+    cmd.args(["-l", "JavaScript", "-e", PANEL, title, request, question, &OPEN_SECS.to_string(), &icon]);
     Some(cmd)
 }
 
-/// What a panel shows of a question: as much as fits, marked where it is cut.
-#[cfg(any(target_os = "macos", windows))]
-fn clip(question: &str) -> String {
-    let q = util::printable(question).trim().to_string();
-    if q.chars().count() <= 900 { q } else { format!("{}…", q.chars().take(900).collect::<String>().trim_end()) }
+/// Text as the person should see it: without direction overrides, invisible spacers or tag characters, which could make
+/// what shows differ from what is there (joiners stay, for emoji and scripts that need them).
+fn plain(text: &str) -> String {
+    let hides = |c: &char| {
+        matches!(c, '\u{61C}' | '\u{200B}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}')
+            || matches!(c, '\u{FEFF}' | '\u{E0000}'..='\u{E007F}')
+    };
+    text.chars().filter(|c| !hides(c)).collect()
+}
+
+/// At most `max` characters of `text`, marked where it is cut.
+fn clip(text: &str, max: usize) -> String {
+    let t = util::printable(text).trim().to_string();
+    if t.chars().count() <= max { t } else { format!("{}…", t.chars().take(max).collect::<String>().trim_end()) }
+}
+
+/// The program that shows the question: in a release build only the system's own, so an agent can't start this machine's
+/// engine with one that answers for its person. (Debug builds take `REASON_NETWORK_<NAME>_BIN`, for tests.)
+fn asker_bin(name: &str, system: &[&str]) -> Option<std::path::PathBuf> {
+    if cfg!(debug_assertions) {
+        return crate::agent::find_bin(name);
+    }
+    system.iter().map(std::path::PathBuf::from).find(|p| p.is_file())
 }
 
 /// Reason's icon for the panel, kept beside the network's database.
@@ -282,19 +417,22 @@ fn icon() -> Option<std::path::PathBuf> {
 /// A notification with buttons: notify-send prints the one clicked, or nothing if it was closed or expired.
 /// (`--wait` and `--action` need libnotify 0.7.10, from 2021; with an older one asking fails, and says so.)
 #[cfg(all(unix, not(target_os = "macos")))]
-fn dialog(title: &str, question: &str) -> Option<Command> {
-    use super::notify::{markup, notify_send};
-    let mut cmd = notify_send()?;
+fn dialog(title: &str, request: &str, question: &str) -> Option<Command> {
+    use super::notify::{markup, notify_send_at};
+    let body =
+        if request.is_empty() { question.to_string() } else { format!("{request}\n\nYour agent asks: {question}") };
+    let mut cmd =
+        notify_send_at(asker_bin("notify-send", &["/usr/bin/notify-send", "/run/current-system/sw/bin/notify-send"])?)?;
     cmd.args(["--app-name=Reason Network", "--wait", "--action=approve=Approve", "--action=deny=Deny"])
         .arg(format!("--expire-time={}", OPEN_SECS * 1000))
-        .args(["--".into(), markup(title), markup(question)]);
+        .args(["--".into(), markup(title), markup(&body)]);
     Some(cmd)
 }
 
 /// The same panel as on macOS: shown on top without taking the keyboard (once clicked into, Return approves and Escape
-/// denies); prints the button and the note.
+/// denies), the request first; prints the button, how much of the request and of the question showed, and the note.
 #[cfg(windows)]
-fn dialog(title: &str, question: &str) -> Option<Command> {
+fn dialog(title: &str, request: &str, question: &str) -> Option<Command> {
     const PANEL: &str = r#"$ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
@@ -303,21 +441,65 @@ $f = New-Object AskPanel
 $f.Text = $env:TINCAN_TITLE; $f.TopMost = $true; $f.StartPosition = 'CenterScreen'; $f.FormBorderStyle = 'FixedDialog'
 $f.MinimizeBox = $false; $f.MaximizeBox = $false; $f.AutoSize = $true; $f.AutoSizeMode = 'GrowAndShrink'; $f.Padding = 12
 $l = New-Object Windows.Forms.FlowLayoutPanel; $l.FlowDirection = 'TopDown'; $l.AutoSize = $true
-$q = New-Object Windows.Forms.Label; $q.UseMnemonic = $false; $q.UseCompatibleTextRendering = $false; $q.Text = $env:TINCAN_BODY; $q.AutoSize = $true; $q.MaximumSize = '420,320'
-# A question too long to show whole ends in "…" where the panel cuts it.
-$s = $q.Text; while ([Windows.Forms.TextRenderer]::MeasureText($q.Text, $q.Font, '420,0', 'WordBreak').Height -gt 320 -and $s) { $s = $s.Substring(0, [Math]::Max(0, $s.Length - 20)).TrimEnd(); $q.Text = $s + [char]0x2026 }
+$q = New-Object Windows.Forms.Label; $q.UseMnemonic = $false; $q.UseCompatibleTextRendering = $false; $q.AutoSize = $true; $q.MaximumSize = '420,320'
+$req = [Globalization.StringInfo]::new([string]$env:TINCAN_REQUEST); $ask = [Globalization.StringInfo]::new([string]$env:TINCAN_QUESTION)
+$reqShown = $req.LengthInTextElements; $askShown = $ask.LengthInTextElements
+# Cut and shown by text elements, so a mark stays with its letter; counted in characters, as the engine counts.
+$cut = { param($s, $k) if ($k -ge $s.LengthInTextElements) { $s.String } elseif ($k -le 0) { [string][char]0x2026 } else { $s.SubstringByTextElements(0, $k).TrimEnd() + [char]0x2026 } }
+$chars = { param($s, $k) [string]$t = if ($k -ge $s.LengthInTextElements) { $s.String } elseif ($k -le 0) { '' } else { $s.SubstringByTextElements(0, $k) }; $t.Length - @($t.ToCharArray() | Where-Object { [char]::IsLowSurrogate($_) }).Count }
+$text = { if ($req.String) { (& $cut $req $reqShown) + "`n`nYour agent asks: " + (& $cut $ask $askShown) } else { & $cut $ask $askShown } }
+$q.Text = & $text
+# Measured the way the label lays it out.
+$fits = { $m = New-Object Windows.Forms.Label; $m.UseMnemonic = $false; $m.UseCompatibleTextRendering = $false; $m.Font = $q.Font; $m.Text = $q.Text; $m.GetPreferredSize('420,0').Height -le 320 }
+while (-not (& $fits) -and ($reqShown + $askShown) -gt 0) {
+  if ($askShown -gt 0) { $askShown = [Math]::Max(0, $askShown - 20) } else { $reqShown = [Math]::Max(0, $reqShown - 20) }
+  $q.Text = & $text
+}
 $note = New-Object Windows.Forms.TextBox; $note.Width = 420
 $b = New-Object Windows.Forms.FlowLayoutPanel; $b.FlowDirection = 'RightToLeft'; $b.Width = 420; $b.Height = 34
 $yes = New-Object Windows.Forms.Button; $yes.Text = 'Approve'; $no = New-Object Windows.Forms.Button; $no.Text = 'Deny'
 $b.Controls.AddRange(@($yes, $no)); $l.Controls.AddRange(@($q, $note, $b)); $f.Controls.Add($l)
 $f.AcceptButton = $yes; $f.CancelButton = $no; $f.ActiveControl = $note
 $script:choice = ''
-$yes.Add_Click({ $script:choice = "approve`n" + $note.Text; $f.Close() })
-$no.Add_Click({ $script:choice = "deny`n" + $note.Text; $f.Close() })
+$yes.Add_Click({ $script:choice = 'approve'; $script:said = $note.Text; $f.Close() })
+$no.Add_Click({ $script:choice = 'deny'; $script:said = $note.Text; $f.Close() })
 $t = New-Object Windows.Forms.Timer; $t.Interval = [int]$env:TINCAN_SECS * 1000; $t.Add_Tick({ $f.Close() }); $t.Start()
 [Windows.Forms.Application]::Run($f)
-$script:choice"#;
-    let mut cmd = super::notify::powershell(PANEL)?;
-    cmd.env("TINCAN_TITLE", title).env("TINCAN_BODY", clip(question)).env("TINCAN_SECS", OPEN_SECS.to_string());
+if ($script:choice) { "$($script:choice)`n$(& $chars $req $reqShown)`n$(& $chars $ask $askShown)`n$($script:said)" }"#;
+    let powershell = asker_bin("powershell", &[r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"])?;
+    let mut cmd = super::notify::powershell_at(powershell, PANEL);
+    cmd.env("TINCAN_TITLE", title).env("TINCAN_REQUEST", request).env("TINCAN_QUESTION", question);
+    cmd.env("TINCAN_SECS", OPEN_SECS.to_string());
     Some(cmd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn what_shows_is_what_is_there() {
+        // A direction override can't turn text around, nor a spacer or tag character hide in it; joiners stay.
+        let family = "\u{1F468}\u{200D}\u{1F469}";
+        assert_eq!(
+            plain(&format!("rename \u{202E}dorp\u{202C} it\u{200B}\u{E0041} {family}")),
+            format!("rename dorp it {family}")
+        );
+        assert_eq!(clip("abcdef", 3), "abc…");
+        assert_eq!(clip("abc", 3), "abc");
+    }
+
+    #[test]
+    fn a_panel_says_how_much_it_showed() {
+        let (answer, shown) = parse("approve\n12\n3\nsend it\n");
+        if cfg!(any(target_os = "macos", windows)) {
+            assert!(matches!(answer, Answer::Approved(n) if n == "send it"));
+            assert_eq!(shown, Some((12, 3)));
+            // One that doesn't say showed nothing.
+            assert_eq!(parse("deny\nabc").1, Some((0, 0)));
+        } else {
+            assert!(matches!(parse("approve\n").0, Answer::Approved(n) if n.is_empty()));
+            assert_eq!(shown, None);
+        }
+    }
 }

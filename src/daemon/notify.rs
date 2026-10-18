@@ -65,7 +65,12 @@ fn command(title: &str, body: &str) -> Option<Command> {
 /// A daemon started outside the desktop session may lack the session bus's address; without a bus, no desktop.
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(super) fn notify_send() -> Option<Command> {
-    let mut cmd = Command::new(agent::find_bin("notify-send")?);
+    notify_send_at(agent::find_bin("notify-send")?)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(super) fn notify_send_at(bin: std::path::PathBuf) -> Option<Command> {
+    let mut cmd = Command::new(bin);
     if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
         let bus = format!("/run/user/{}/bus", unsafe { libc::getuid() });
         if !std::path::Path::new(&bus).exists() {
@@ -99,10 +104,15 @@ $n::CreateToastNotifier($app).Show([Windows.UI.Notifications.ToastNotification]:
 
 #[cfg(windows)]
 pub(super) fn powershell(script: &str) -> Option<Command> {
+    Some(powershell_at(agent::find_bin("powershell")?, script))
+}
+
+#[cfg(windows)]
+pub(super) fn powershell_at(bin: std::path::PathBuf, script: &str) -> Command {
     use std::os::windows::process::CommandExt;
-    let mut cmd = Command::new(agent::find_bin("powershell")?);
+    let mut cmd = Command::new(bin);
     cmd.args(["-NoProfile", "-NonInteractive", "-Command", script]);
     // CREATE_NO_WINDOW: no console flashing up next to the notification.
     cmd.creation_flags(0x0800_0000);
-    Some(cmd)
+    cmd
 }
