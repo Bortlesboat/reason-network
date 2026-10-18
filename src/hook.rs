@@ -50,6 +50,9 @@ async fn handle(
     let v: Value = serde_json::from_str(input.trim_start_matches('\u{feff}')).unwrap_or(Value::Null);
     let agent = agent::from_client_name(agent_name).unwrap_or(agent_name);
     let str_at = |k: &str| v.get(k).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
+    if agent == "grok" && grok_ignores(event, &v) {
+        return None;
+    }
 
     let session_id = session
         .or_else(|| str_at("session_id"))
@@ -72,8 +75,7 @@ async fn handle(
         ("doing", _) => "doing",
         _ => return None,
     };
-    // Prompt-submit hooks in Cursor and Copilot can't add context, and opencode's status call shows nothing.
-    let mail = !matches!((agent, event), ("cursor" | "copilot", "user-prompt-submit") | (_, "status" | "doing"));
+    let mail = takes_mail(agent, event);
 
     let key = format!("{agent}:{session_id}");
     let req = Request::Hook(HookCall {
@@ -102,6 +104,21 @@ async fn handle(
     Some((format_for(agent, event, ev, &text), key, ids))
 }
 
+/// Prompt-submit hooks in Cursor, Copilot and grok can't add context, grok drops what SessionStart prints, and
+/// opencode's status call shows nothing.
+fn takes_mail(agent: &str, event: &str) -> bool {
+    !matches!(
+        (agent, event),
+        ("cursor" | "copilot" | "grok", "user-prompt-submit") | ("grok", "session-start") | (_, "status" | "doing")
+    )
+}
+
+/// grok runs a subagent's hooks under the subagent's own session id, and after SessionEnd fires one more Stop
+/// (reason "shutdown" or "channel_closed") whose block it ignores.
+fn grok_ignores(event: &str, v: &Value) -> bool {
+    !v["subagentType"].is_null() || (event == "stop" && v["reason"] != "end_turn")
+}
+
 /// The JSON (or text) each agent expects from this hook to put `text` in front of the model.
 fn format_for(agent: &str, event: &str, ev: &str, text: &str) -> String {
     let specific = |name: &str| json!({ "hookSpecificOutput": { "hookEventName": name, "additionalContext": text } });
@@ -111,10 +128,11 @@ fn format_for(agent: &str, event: &str, ev: &str, text: &str) -> String {
         ("codex", "start") => specific("SessionStart"),
         ("codex", "prompt") => specific("UserPromptSubmit"),
         ("codex", "tool") => specific("PostToolUse"),
+        ("grok", "tool") => specific("PostToolUse"),
         ("gemini", "start") => specific("SessionStart"),
         ("gemini", "prompt") => specific("BeforeAgent"),
         ("gemini", "tool") => specific("AfterTool"),
-        ("codex" | "gemini" | "copilot", "stop") => block(),
+        ("codex" | "gemini" | "copilot" | "grok", "stop") => block(),
         ("cursor", "stop") => json!({ "followup_message": text }),
         ("cursor", _) => json!({ "additional_context": text }),
         ("copilot", _) => json!({ "additionalContext": text }),
@@ -139,7 +157,8 @@ fn format_for(agent: &str, event: &str, ev: &str, text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::format_for;
+    use super::{format_for, grok_ignores, takes_mail};
+    use serde_json::json;
 
     #[test]
     fn formats() {
@@ -149,6 +168,23 @@ mod tests {
         assert_eq!(format_for("cursor", "post-tool-use", "tool", "hi"), r#"{"additional_context":"hi"}"#);
         assert_eq!(format_for("copilot", "session-start", "start", "hi"), r#"{"additionalContext":"hi"}"#);
         assert!(format_for("gemini", "user-prompt-submit", "prompt", "hi").contains("BeforeAgent"));
+        assert!(format_for("grok", "post-tool-use", "tool", "hi").contains("\"PostToolUse\""));
+        assert_eq!(format_for("grok", "stop", "stop", "hi"), r#"{"decision":"block","reason":"hi"}"#);
         assert_eq!(format_for("opencode", "poll", "stop", "hi"), "hi");
+    }
+
+    #[test]
+    fn grok_payloads() {
+        assert!(!takes_mail("grok", "session-start"));
+        assert!(!takes_mail("grok", "user-prompt-submit"));
+        assert!(takes_mail("grok", "post-tool-use"));
+        assert!(takes_mail("grok", "stop"));
+        assert!(takes_mail("codex", "session-start"));
+        assert!(!grok_ignores("stop", &json!({ "reason": "end_turn" })));
+        assert!(grok_ignores("stop", &json!({ "reason": "shutdown" })));
+        assert!(grok_ignores("stop", &json!({ "reason": "channel_closed" })));
+        assert!(!grok_ignores("session-end", &json!({ "reason": "shutdown" })));
+        assert!(!grok_ignores("post-tool-use", &json!({ "subagentType": null })));
+        assert!(grok_ignores("post-tool-use", &json!({ "subagentType": "general-purpose" })));
     }
 }

@@ -20,6 +20,8 @@ pub fn detect_env() -> Option<&'static str> {
         Some(CLAUDE_CODE)
     } else if has("CODEX_THREAD_ID") || has("CODEX_SESSION_ID") {
         Some("codex")
+    } else if has("GROK_SESSION_ID") || has("GROK_WORKSPACE_ROOT") {
+        Some("grok")
     } else if has("GEMINI_CLI") {
         Some("gemini")
     } else if has("CURSOR_AGENT") {
@@ -46,6 +48,8 @@ pub fn from_client_name(name: &str) -> Option<&'static str> {
         "cursor"
     } else if has("gemini") {
         "gemini"
+    } else if has("grok") {
+        "grok"
     } else if has("opencode") {
         "opencode"
     } else if has("copilot") {
@@ -82,6 +86,7 @@ pub fn env_session_id(agent: &str) -> Option<String> {
         "copilot" => "COPILOT_AGENT_SESSION_ID",
         "gemini" => "GEMINI_SESSION_ID",
         "codex" => "CODEX_THREAD_ID",
+        "grok" => "GROK_SESSION_ID",
         "opencode" => "OPENCODE_SESSION_ID",
         _ => return None,
     };
@@ -163,6 +168,7 @@ pub fn short(agent: &str) -> &str {
 pub fn label(agent: &str) -> &str {
     match agent {
         "codex" => "Codex",
+        "grok" => "Grok",
         "reason" => "Reason",
         a => a,
     }
@@ -242,6 +248,8 @@ mod tests {
         assert_eq!(from_client_name("codex-mcp-client"), Some("codex"));
         assert_eq!(from_client_name("cursor-vscode"), Some("cursor"));
         assert_eq!(from_client_name("gemini-cli-mcp-client"), Some("gemini"));
+        // grok names its client after the server, so this one also contains "reason".
+        assert_eq!(from_client_name("grok-shell-reason-network"), Some("grok"));
         assert_eq!(from_client_name("claude-ai"), Some("claude-desktop"));
         assert_eq!(from_client_name("example-client"), None);
     }
