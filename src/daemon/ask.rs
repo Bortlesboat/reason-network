@@ -68,7 +68,8 @@ impl Daemon {
         let waiting = Waiting { daemon: self, key: &key };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(MAX_WAIT);
         loop {
-            // The answer, and the client giving up on the call (`StopWaiting`), both wake `arrived`.
+            // The answer, and the client giving up on the call (`StopWaiting`), both wake `arrived`. Giving up is per
+            // session: its other waits end too, and their answer comes as a message.
             let woke = self.arrived.notified();
             tokio::pin!(woke);
             woke.as_mut().enable();
@@ -225,6 +226,7 @@ function run([title, question, secs, icon]) {
   panel.title = title
   panel.level = 8
   panel.becomesKeyOnlyIfNeeded = true
+  panel.collectionBehavior = 1 | 256 // on every Space, and over full-screen apps
   const put = (view, x, y, w, vh) => { view.frame = $.NSMakeRect(x, y, w, vh); panel.contentView.addSubview(view) }
   put(label, 86, 84, 330, h)
   const image = icon && $.NSImage.alloc.initWithContentsOfFile(icon)
@@ -252,10 +254,16 @@ function run([title, question, secs, icon]) {
 #[cfg(target_os = "macos")]
 fn dialog(title: &str, question: &str) -> Option<Command> {
     let mut cmd = Command::new(crate::agent::find_bin("osascript")?);
-    let question: String = util::printable(question).trim().chars().take(1500).collect();
     let icon = icon().map(|p| p.display().to_string()).unwrap_or_default();
-    cmd.args(["-l", "JavaScript", "-e", PANEL, title, &question, &OPEN_SECS.to_string(), &icon]);
+    cmd.args(["-l", "JavaScript", "-e", PANEL, title, &clip(question), &OPEN_SECS.to_string(), &icon]);
     Some(cmd)
+}
+
+/// What a panel shows of a question: as much as fits, marked where it is cut.
+#[cfg(any(target_os = "macos", windows))]
+fn clip(question: &str) -> String {
+    let q = util::printable(question).trim().to_string();
+    if q.chars().count() <= 900 { q } else { format!("{}…", q.chars().take(900).collect::<String>().trim_end()) }
 }
 
 /// Reason's icon for the panel, kept beside the network's database.
@@ -286,14 +294,14 @@ fn dialog(title: &str, question: &str) -> Option<Command> {
 #[cfg(windows)]
 fn dialog(title: &str, question: &str) -> Option<Command> {
     const PANEL: &str = r#"$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
-# Shown on top without taking the keyboard: what's typed elsewhere can't answer it; once clicked into, Return approves.
 Add-Type -WarningAction SilentlyContinue -ReferencedAssemblies System.Windows.Forms -TypeDefinition 'public class AskPanel : System.Windows.Forms.Form { protected override bool ShowWithoutActivation { get { return true; } } }'
 $f = New-Object AskPanel
 $f.Text = $env:TINCAN_TITLE; $f.TopMost = $true; $f.StartPosition = 'CenterScreen'; $f.FormBorderStyle = 'FixedDialog'
 $f.MinimizeBox = $false; $f.MaximizeBox = $false; $f.AutoSize = $true; $f.AutoSizeMode = 'GrowAndShrink'; $f.Padding = 12
 $l = New-Object Windows.Forms.FlowLayoutPanel; $l.FlowDirection = 'TopDown'; $l.AutoSize = $true
-$q = New-Object Windows.Forms.Label; $q.Text = $env:TINCAN_BODY; $q.AutoSize = $true; $q.MaximumSize = '420,320'
+$q = New-Object Windows.Forms.Label; $q.UseMnemonic = $false; $q.Text = $env:TINCAN_BODY; $q.AutoSize = $true; $q.MaximumSize = '420,320'
 $note = New-Object Windows.Forms.TextBox; $note.Width = 420
 $b = New-Object Windows.Forms.FlowLayoutPanel; $b.FlowDirection = 'RightToLeft'; $b.Width = 420; $b.Height = 34
 $yes = New-Object Windows.Forms.Button; $yes.Text = 'Approve'; $no = New-Object Windows.Forms.Button; $no.Text = 'Deny'
@@ -306,6 +314,6 @@ $t = New-Object Windows.Forms.Timer; $t.Interval = [int]$env:TINCAN_SECS * 1000;
 [Windows.Forms.Application]::Run($f)
 $script:choice"#;
     let mut cmd = super::notify::powershell(PANEL)?;
-    cmd.env("TINCAN_TITLE", title).env("TINCAN_BODY", question).env("TINCAN_SECS", OPEN_SECS.to_string());
+    cmd.env("TINCAN_TITLE", title).env("TINCAN_BODY", clip(question)).env("TINCAN_SECS", OPEN_SECS.to_string());
     Some(cmd)
 }
