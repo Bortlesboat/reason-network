@@ -2,6 +2,7 @@
 //! mailboxes. Split by concern: `sessions` (who is running here), `directory` (who is where, and resolving
 //! addresses), `mail` (sending, receiving, delivering), `teamops` (membership and the network).
 
+mod ask;
 mod directory;
 mod mail;
 mod notify;
@@ -110,6 +111,8 @@ pub struct Daemon {
     rate: Mutex<HashMap<String, VecDeque<Instant>>>,
     /// When a notification from each sender was last shown here.
     shown: Mutex<HashMap<String, Instant>>,
+    /// Each session's `ask_user` question that is up, with its answer once there is one.
+    asks: Mutex<HashMap<String, tokio::sync::watch::Sender<Option<ask::Answer>>>>,
 }
 
 struct Inner {
@@ -189,6 +192,7 @@ impl Daemon {
             net: RwLock::new(None),
             rate: Mutex::new(HashMap::new()),
             shown: Mutex::new(HashMap::new()),
+            asks: Mutex::new(HashMap::new()),
         })
     }
 
@@ -239,7 +243,7 @@ impl Daemon {
                     continue;
                 }
             };
-            let wait = matches!(f.body, Request::Inbox { .. });
+            let wait = matches!(f.body, Request::Inbox { .. } | Request::Ask { .. });
             let (this, tx) = (self.clone(), tx.clone());
             // Each request runs on its own task: an inbox long-poll must not block the connection.
             let task = async move {
@@ -273,6 +277,7 @@ impl Daemon {
             }
             Request::Inbox { key, wait_secs, peek } => json!(self.inbox(key, wait_secs.min(MAX_WAIT), peek).await?),
             Request::Unread { key } => json!(self.unread(&key)?),
+            Request::Ask { key, question, wait_secs } => json!(self.ask(key, question, wait_secs.min(MAX_WAIT)).await?),
             Request::StopWaiting { key } => {
                 self.stop_waiting(&key).await;
                 Value::Null

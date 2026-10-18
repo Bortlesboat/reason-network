@@ -227,6 +227,7 @@ fn changed(path: &Path, did: bool) -> String {
 fn claude(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     let Some(bin) = agent::find_bin("claude") else { return Ok(None) };
     let mut r = Report { agent: "Claude Code", lines: Vec::new(), notes: Vec::new() };
+    claude_allow_ask(remove, dry, &mut r)?;
     let get = |name: &str| -> Result<(bool, bool)> {
         let out = Command::new(&bin).args(["mcp", "get", name]).stdin(std::process::Stdio::null()).output()?;
         let existing = out.status.success();
@@ -277,6 +278,25 @@ fn claude(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
         r.lines.push(format!("added the {AGENT_NAME} MCP server (user scope)"));
     }
     Ok(Some(r))
+}
+
+/// `ask_user` only shows the person a pop-up, so it is allowed: it never waits on a prompt in a terminal nobody is
+/// watching. The other tools keep Claude Code's own permission prompts.
+fn claude_allow_ask(remove: bool, dry: bool, r: &mut Report) -> Result<()> {
+    let rule = format!("mcp__{AGENT_NAME}__ask_user");
+    let path = paths::claude_dir().join("settings.json");
+    let mut v = read_json(&path)?;
+    let perms = obj(obj(&mut v)?.entry("permissions").or_insert_with(|| json!({})))?;
+    let Some(allow) = perms.entry("allow").or_insert_with(|| json!([])).as_array_mut() else {
+        return Err(anyhow!("{}: permissions.allow isn't a list", path.display()));
+    };
+    if remove {
+        allow.retain(|x| *x != rule);
+    } else if !allow.iter().any(|x| *x == rule) {
+        allow.push(json!(rule));
+    }
+    r.lines.push(changed(&path, write_json(&path, &v, dry)?));
+    Ok(())
 }
 
 // ---- Codex ----

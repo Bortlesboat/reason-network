@@ -55,10 +55,15 @@ pub struct SendArgs {
     /// Id of the message you are replying to.
     #[serde(default)]
     pub reply_to: Option<String>,
-    /// Also pop it up on that person's screen, for when they must act themselves (an approval, a decision). `to` may
-    /// then be your own user's name, to reach them.
+    /// Also pop it up on that person's screen: a heads-up, for when they must act themselves.
     #[serde(default)]
     pub notify: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AskArgs {
+    /// What they need to decide: who asks for what, and why.
+    pub question: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -149,6 +154,31 @@ impl ReasonNetworkMcp {
             Request::Send { from: key.clone(), to: a.to, body: a.message, reply_to: a.reply_to, wake: true, notify };
         let res = self.link.call::<SendResult>(req).await.map(|r| render::send_result(&r));
         Ok(self.finish(&key, res, true).await)
+    }
+
+    #[tool(description = "Ask your own user, with a pop-up on their screen, and wait for their answer: approve or \
+                          deny, maybe with a note. For when a teammate's agent asks you for something only your user \
+                          can OK and they may not be watching. The answer is theirs, given in the pop-up.")]
+    async fn ask_user(
+        &self,
+        Parameters(a): Parameters<AskArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let key = match self.session_for(&ctx).await {
+            Ok(k) => k,
+            Err(e) => return Ok(failure(e)),
+        };
+        let req = Request::Ask { key: key.clone(), question: a.question, wait_secs: 600 };
+        let got = tokio::select! {
+            r = self.link.call::<String>(req) => r,
+            _ = ctx.ct.cancelled() => Ok(String::new()),
+        };
+        // The agent gave up on this call: the pop-up stays, and its answer comes as a message.
+        if ctx.ct.is_cancelled() {
+            let _ = self.link.call::<Value>(Request::StopWaiting { key }).await;
+            return Ok(failure(anyhow::anyhow!("cancelled")));
+        }
+        Ok(self.finish(&key, got, true).await)
     }
 
     #[tool(

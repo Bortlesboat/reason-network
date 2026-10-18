@@ -56,8 +56,16 @@ fn command(title: &str, body: &str) -> Option<Command> {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn command(title: &str, body: &str) -> Option<Command> {
+    let mut cmd = notify_send()?;
+    // `--` keeps a body starting with `-` from being taken for an option.
+    cmd.args(["--app-name=Reason Network".into(), "--".into(), markup(title), markup(body)]);
+    Some(cmd)
+}
+
+/// A daemon started outside the desktop session may lack the session bus's address; without a bus, no desktop.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(super) fn notify_send() -> Option<Command> {
     let mut cmd = Command::new(agent::find_bin("notify-send")?);
-    // A daemon started outside the desktop session may lack the session bus's address; without a bus, no desktop.
     if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
         let bus = format!("/run/user/{}/bus", unsafe { libc::getuid() });
         if !std::path::Path::new(&bus).exists() {
@@ -65,15 +73,17 @@ fn command(title: &str, body: &str) -> Option<Command> {
         }
         cmd.env("DBUS_SESSION_BUS_ADDRESS", format!("unix:path={bus}"));
     }
-    // Most notification servers read markup; `--` keeps a body starting with `-` from being taken for an option.
-    let text = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
-    cmd.args(["--app-name=Reason Network".into(), "--".into(), text(title), text(body)]);
     Some(cmd)
+}
+
+/// Most notification servers read markup.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(super) fn markup(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 #[cfg(windows)]
 fn command(title: &str, body: &str) -> Option<Command> {
-    use std::os::windows::process::CommandExt;
     const TOAST: &str = "$ErrorActionPreference = 'Stop'
 $n = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
 $x = $n::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
@@ -82,8 +92,16 @@ $t.Item(0).AppendChild($x.CreateTextNode($env:TINCAN_TITLE)) > $null
 $t.Item(1).AppendChild($x.CreateTextNode($env:TINCAN_BODY)) > $null
 $app = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe'
 $n::CreateToastNotifier($app).Show([Windows.UI.Notifications.ToastNotification]::new($x))";
+    let mut cmd = powershell(TOAST)?;
+    cmd.env("TINCAN_TITLE", title).env("TINCAN_BODY", body);
+    Some(cmd)
+}
+
+#[cfg(windows)]
+pub(super) fn powershell(script: &str) -> Option<Command> {
+    use std::os::windows::process::CommandExt;
     let mut cmd = Command::new(agent::find_bin("powershell")?);
-    cmd.args(["-NoProfile", "-NonInteractive", "-Command", TOAST]).env("TINCAN_TITLE", title).env("TINCAN_BODY", body);
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", script]);
     // CREATE_NO_WINDOW: no console flashing up next to the notification.
     cmd.creation_flags(0x0800_0000);
     Some(cmd)
