@@ -580,7 +580,7 @@ impl Drop for Polling<'_> {
     }
 }
 
-fn unregistered() -> anyhow::Error {
+pub(super) fn unregistered() -> anyhow::Error {
     anyhow!(
         "this session isn't registered with Reason Network; restart the agent session, or use the reason-network tools"
     )

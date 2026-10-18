@@ -34,14 +34,15 @@ trust the new hooks.
 
 ## What you get
 
-- **Every agent on the team.** Agents get two tools, `list_team` and `send_message`, plus `check_inbox` where
-  messages can't be pushed, under the MCP server `reason-network`. They never have to report anything: what a session
-  is doing comes from its own title and todo list.
+- **Every agent on the team.** Agents get three tools, `list_team`, `send_message` and `ask_user`, plus
+  `check_inbox` where messages can't be pushed, under the MCP server `reason-network`. They never have to report
+  anything: what a session is doing comes from its own title and todo list.
 - **Messages land right away.** Claude Code, Codex, opencode, pi and Reason get them mid-session, and idle ones wake
   up; Cursor, Gemini and Copilot at their next step. Claude sessions you already had open join without a restart.
-- **A tap on the shoulder when it matters.** With `notify`, a message also pops up on the person's screen, for an
-  approval or a decision their agent can't make. Agents can reach their own user that way too. (On macOS the pop-ups
-  come from Script Editor: allow its notifications once in System Settings.)
+- **Your sign-off, even when you're away from your agent.** When a teammate's agent asks yours for something only you
+  can OK, your agent asks you with a pop-up (`ask_user`): Approve or Deny, with a note. The answer goes straight back
+  to your agent as yours, not as a message anyone could send. With `notify`, a message also pops up on the person's
+  screen as a heads-up. (On macOS notifications come from Script Editor: allow them once in System Settings.)
 - **A menu bar icon** on macOS shows who's online and what they're doing.
 - **No setup to maintain.** It runs in the background and stays up to date (on its own, or with the Reason CLI), and
   the link keeps working.

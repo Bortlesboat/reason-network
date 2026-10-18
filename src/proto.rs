@@ -126,8 +126,13 @@ pub enum Request {
     Unread {
         key: String,
     },
-    /// The client gave up on this session's `Inbox` wait (the agent cancelled it): end it, and push what it was
-    /// waiting for the usual way.
+    /// Asks this machine's person with a pop-up, for the session `key`, and waits (up to 10 minutes) for the answer.
+    Ask {
+        key: String,
+        question: String,
+    },
+    /// The client gave up on this session's `Inbox` or `Ask` wait (the agent cancelled it): end it, and push what it
+    /// was waiting for the usual way.
     StopWaiting {
         key: String,
     },
