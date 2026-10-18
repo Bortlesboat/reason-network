@@ -168,6 +168,7 @@ pub fn short(agent: &str) -> &str {
 pub fn label(agent: &str) -> &str {
     match agent {
         "codex" => "Codex",
+        "grok" => "Grok",
         "reason" => "Reason",
         a => a,
     }

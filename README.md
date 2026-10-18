@@ -38,7 +38,7 @@ trust the new hooks.
   messages can't be pushed, under the MCP server `reason-network`. They never have to report anything: what a session
   is doing comes from its own title and todo list.
 - **Messages land right away.** Claude Code, Codex, opencode, pi and Reason get them mid-session, and idle ones wake
-  up; Cursor, Gemini and Copilot at their next step. Claude sessions you already had open join without a restart.
+  up; Cursor, Gemini, Copilot and Grok at their next step. Claude sessions you already had open join without a restart.
 - **A tap on the shoulder when it matters.** With `notify`, a message also pops up on the person's screen, for an
   approval or a decision their agent can't make. Agents can reach their own user that way too. (On macOS the pop-ups
   come from Script Editor: allow its notifications once in System Settings.)

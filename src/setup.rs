@@ -354,7 +354,7 @@ fn codex(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
 // ---- Grok CLI ----
 
 fn grok_home() -> PathBuf {
-    std::env::var_os("GROK_HOME").map(PathBuf::from).unwrap_or_else(|| home().join(".grok"))
+    std::env::var_os("GROK_HOME").filter(|h| !h.is_empty()).map(PathBuf::from).unwrap_or_else(|| home().join(".grok"))
 }
 
 /// grok reads the MCP server from `config.toml` and Claude-Code-style hook groups from `hooks/*.json` (global hook
@@ -392,6 +392,7 @@ fn grok(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
         t["tool_timeout_sec"] = toml_edit::value(660);
         servers[AGENT_NAME] = toml_edit::Item::Table(t);
     }
+    grok_allow(&mut doc, remove);
     r.lines.push(changed(&cfg_path, write_file(&cfg_path, &doc.to_string(), dry)?));
 
     let hooks_path = dir.join(format!("hooks/{AGENT_NAME}.json"));
@@ -424,6 +425,32 @@ fn grok(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
         r.lines.push(changed(&hooks_path, did));
     }
     Ok(Some(r))
+}
+
+/// grok asks before every MCP tool call unless a rule allows it.
+fn grok_allow(doc: &mut toml_edit::DocumentMut, remove: bool) {
+    let rule = format!("MCPTool({AGENT_NAME}__*)");
+    if remove {
+        if let Some(permission) = doc.get_mut("permission").and_then(|p| p.as_table_like_mut()) {
+            if let Some(allow) = permission.get_mut("allow").and_then(|a| a.as_array_mut()) {
+                allow.retain(|v| v.as_str() != Some(rule.as_str()));
+                if allow.is_empty() {
+                    permission.remove("allow");
+                }
+            }
+            if permission.is_empty() {
+                doc.remove("permission");
+            }
+        }
+        return;
+    }
+    let allow = doc.entry("permission").or_insert(toml_edit::table())["allow"]
+        .or_insert(toml_edit::value(toml_edit::Array::new()));
+    if let Some(allow) = allow.as_array_mut()
+        && !allow.iter().any(|v| v.as_str() == Some(rule.as_str()))
+    {
+        allow.push(rule);
+    }
 }
 
 // ---- Cursor ----
@@ -1277,6 +1304,21 @@ pub async fn doctor() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grok_allow_rule() {
+        let mut doc: toml_edit::DocumentMut = "[permission]\nallow = [\"Bash(ls)\"]\n".parse().unwrap();
+        grok_allow(&mut doc, false);
+        grok_allow(&mut doc, false);
+        assert_eq!(doc.to_string(), "[permission]\nallow = [\"Bash(ls)\", \"MCPTool(reason-network__*)\"]\n");
+        grok_allow(&mut doc, true);
+        assert_eq!(doc.to_string(), "[permission]\nallow = [\"Bash(ls)\"]\n");
+        let mut doc = toml_edit::DocumentMut::new();
+        grok_allow(&mut doc, false);
+        assert!(doc.to_string().contains("MCPTool(reason-network__*)"));
+        grok_allow(&mut doc, true);
+        assert_eq!(doc.to_string(), "");
+    }
 
     #[test]
     fn hook_groups_merge_and_remove() {

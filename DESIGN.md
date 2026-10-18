@@ -139,12 +139,12 @@ session connection also receives pushed `deliver` events for its sessions.
 
 **Session registration**, by priority:
 1. Per-call `_meta`: Codex `sessionId` (the root thread, same id its hooks see), opencode V2 `ai.opencode/sessionID`.
-2. Env: `CLAUDE_CODE_SESSION_ID` (Claude), `COPILOT_AGENT_SESSION_ID` (Copilot).
+2. Env: `CLAUDE_CODE_SESSION_ID` (Claude), `COPILOT_AGENT_SESSION_ID` (Copilot), `GROK_SESSION_ID` (Grok).
 3. Hook stdin `session_id` (`SessionStart`), correlated to the MCP process by agent PID ancestry.
 4. Fallback: one session per MCP process.
 
 Agent kind comes from MCP `clientInfo.name` plus env (`CLAUDECODE`, `CODEX_*`, `GEMINI_CLI`,
-`CURSOR_AGENT`, `OPENCODE`, `COPILOT_CLI`).
+`CURSOR_AGENT`, `OPENCODE`, `COPILOT_CLI`, `GROK_SESSION_ID`).
 
 **Passive discovery.** Claude Code writes every live session to `~/.claude/sessions/<pid>.json` (name, cwd,
 busy/idle). The daemon reads these, so Claude sessions show up with live busy/idle status even without our
@@ -169,7 +169,7 @@ The hard part. Each session advertises a **delivery tier** so senders know when 
 | Cursor | turn | `postToolUse` `additional_context`; `stop` `followup_message`. Idle: background `reason-network wait`. |
 | Gemini CLI | turn | `AfterTool` `additionalContext`; `AfterAgent` block. Idle: experimental background-shell inject. |
 | Copilot CLI | turn | `postToolUse` `additionalContext`; `agentStop` block; `notification` hook. |
-| Grok CLI | turn | `PostToolUse` `additionalContext`; `Stop` block. Prompt-submit output is dropped. |
+| Grok CLI | turn | `PostToolUse` `additionalContext`; `Stop` (`end_turn`) block. SessionStart and prompt-submit output are dropped; subagents' hooks are ignored. |
 | any MCP client | pull | Tools + unread notice on every tool result + `check_inbox(wait_secs)` long-poll. |
 
 MCP notifications are not a delivery path: no client passes them to the model (checked Oct 2026).
@@ -244,7 +244,7 @@ With Reason, `reason network` does all of it: the workspace is the team.
 `join`/`init` run `setup`, which detects installed agents and wires each one (backing up every file it
 edits): Claude Code plugin or `claude mcp add --scope user` + hooks, `~/.codex/config.toml` + `hooks.json`,
 `~/.cursor/mcp.json` + `hooks.json`, `~/.gemini/settings.json`, opencode plugin + MCP, Copilot
-`mcp-config.json` + hooks. Or paste one line into any agent: "install Reason Network and join cm1…".
+`mcp-config.json` + hooks, `~/.grok/config.toml` + `hooks/reason-network.json`. Or paste one line into any agent: "install Reason Network and join cm1…".
 
 ## Milestones
 
