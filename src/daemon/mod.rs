@@ -273,11 +273,11 @@ impl Daemon {
             Request::SetStatus { key, doing, name } => json!(self.set_status(&key, doing, name)?),
             Request::Who { me, filter, all } => json!(self.who(me, filter, all).await?),
             Request::Send { from, to, body, reply_to, wake, notify } => {
-                json!(self.send(from, &to, &body, reply_to, wake, notify).await?)
+                json!(self.send(from, &to, &body, reply_to, wake, notify, None).await?)
             }
             Request::Inbox { key, wait_secs, peek } => json!(self.inbox(key, wait_secs.min(MAX_WAIT), peek).await?),
             Request::Unread { key } => json!(self.unread(&key)?),
-            Request::Ask { key, question } => json!(self.ask(key, question).await?),
+            Request::Ask { key, question, about } => json!(self.ask(key, question, about).await?),
             Request::StopWaiting { key } => {
                 self.stop_waiting(&key).await;
                 Value::Null

@@ -64,13 +64,16 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE INDEX IF NOT EXISTS sessions_key ON sessions (key);
 ";
 
-const MESSAGE_COLS: &str = "id, sender, sender_agent, sender_repo, recipient, via, reply_to, body, wake, sent_at";
+const MESSAGE_COLS: &str =
+    "id, sender, sender_agent, sender_repo, recipient, via, reply_to, body, wake, sent_at, approval";
 const SESSION_COLS: &str = "name, key, agent, cwd, repo, branch, doing, tier, last_seen";
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let db = Connection::open(path)?;
         db.execute_batch(SCHEMA)?;
+        // Added in 0.10.7; this fails, harmlessly, once the column is there.
+        let _ = db.execute("ALTER TABLE messages ADD COLUMN approval TEXT", []);
         Ok(Store { db })
     }
 
@@ -78,11 +81,29 @@ impl Store {
     pub fn insert(&self, m: &Message, held: bool) -> Result<bool> {
         let n = self.db.execute(
             &format!(
-                "INSERT OR IGNORE INTO messages ({MESSAGE_COLS}, held) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+                "INSERT OR IGNORE INTO messages ({MESSAGE_COLS}, held) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
             ),
-            params![m.id, m.from, m.from_agent, m.from_repo, m.to, m.via, m.reply_to, m.body, m.wake, m.sent_at, held],
+            params![
+                m.id,
+                m.from,
+                m.from_agent,
+                m.from_repo,
+                m.to,
+                m.via,
+                m.reply_to,
+                m.body,
+                m.wake,
+                m.sent_at,
+                m.approval.as_ref().map(|a| serde_json::to_string(a).expect("approvals serialize")),
+                held
+            ],
         )?;
         Ok(n == 1)
+    }
+
+    pub fn message(&self, id: &str) -> Result<Option<Message>> {
+        let sql = format!("SELECT {MESSAGE_COLS} FROM messages WHERE id = ?1");
+        Ok(self.db.query_row(&sql, [id], message).optional()?)
     }
 
     pub fn has(&self, id: &str) -> Result<bool> {
@@ -233,6 +254,7 @@ fn message(r: &Row) -> rusqlite::Result<Message> {
         wake: r.get(8)?,
         notify: false,
         sent_at: r.get(9)?,
+        approval: r.get::<_, Option<String>>(10)?.and_then(|a| serde_json::from_str(&a).ok()),
     })
 }
 

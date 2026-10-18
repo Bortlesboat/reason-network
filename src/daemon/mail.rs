@@ -5,7 +5,7 @@
 //! don't show them a second time.
 
 use super::{Daemon, Inner, directory::Target, log};
-use crate::{agent, claude, config::Policy, proto::*, render, util};
+use crate::{agent, claude, config::Policy, proto::*, render, team::Signed, util};
 use anyhow::{Result, anyhow, bail};
 use iroh::EndpointId;
 use std::{
@@ -71,6 +71,7 @@ const LOOP_NOTE: &str = "refused: these two agents have exchanged a lot of messa
                          looks like a loop. Check with your user before continuing.";
 
 impl Daemon {
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn send(
         self: &Arc<Self>,
         from: String,
@@ -79,6 +80,7 @@ impl Daemon {
         reply_to: Option<String>,
         wake: bool,
         notify: bool,
+        approval: Option<Box<Signed<Approval>>>,
     ) -> Result<SendResult> {
         let (body, to) = (body.trim(), to.trim());
         if body.is_empty() {
@@ -134,6 +136,7 @@ impl Daemon {
                     wake: false,
                     notify: true,
                     sent_at: now,
+                    approval: None,
                 };
                 let (sent, note) = self.notify(&msg);
                 let state = if sent { "notified" } else { "not notified" };
@@ -167,6 +170,7 @@ impl Daemon {
                     wake,
                     notify,
                     sent_at: now,
+                    approval: approval.clone(),
                 };
                 res.ids.push(msg.id.clone());
                 let here = !matches!(t, Target::Remote { .. });
@@ -419,7 +423,7 @@ impl Daemon {
             .team_state()
             .and_then(|t| t.member(&peer).map(|m| m.person.clone()))
             .ok_or_else(|| anyhow!("not a team member"))?;
-        let msg = clean(msg)?;
+        let mut msg = clean(msg)?;
         // Messages go between agent sessions (or, with notify, to a person's screen); an older Reason Network may still send
         // to or from a person.
         if !msg.from.contains('/') || (!msg.to.contains('/') && !msg.notify) {
@@ -428,6 +432,15 @@ impl Daemon {
         // A machine speaks only for its own agents.
         if !msg.from.starts_with(&format!("{sender}/")) {
             bail!("{} cannot send as {}", sender, msg.from);
+        }
+        // An approval stands only if the sending machine signed it, as its own person, about a request from the session
+        // it came to; any other is dropped, and the message says so.
+        if let Some(a) = &msg.approval {
+            let signed = self.team_state().is_some_and(|t| a.verify(t.name(), "approval"));
+            if !(signed && a.by == peer && a.body.approver == sender && a.body.asker == msg.to) {
+                msg.approval = None;
+                msg.body.push_str("\n\n(It came with an approval that didn't verify.)");
+            }
         }
         let policy = self.cfg.policy_for(&sender);
         if policy == Policy::Refuse {

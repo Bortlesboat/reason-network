@@ -130,6 +130,9 @@ pub enum Request {
     Ask {
         key: String,
         question: String,
+        /// A teammate's message the question is about: shown with it, and sent the answer, signed.
+        #[serde(default)]
+        about: Option<String>,
     },
     /// The client gave up on this session's `Inbox` or `Ask` wait (the agent cancelled it): end it, and push what it
     /// was waiting for the usual way.
@@ -242,6 +245,22 @@ pub enum Event {
     Deliver { key: String, ids: Vec<String>, text: String },
 }
 
+/// A person's answer in an `ask_user` pop-up about a teammate's request, signed by the machine they gave it on: it
+/// names the request, so it can't be passed off as the answer to another.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Approval {
+    /// The request (a message id) and the session that sent it.
+    pub about: String,
+    pub asker: String,
+    pub approver: String,
+    pub approved: bool,
+    /// What the person saw: the agent's question and the request.
+    pub question: String,
+    pub request: String,
+    pub note: String,
+    pub at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub id: String,
@@ -260,6 +279,9 @@ pub struct Message {
     #[serde(default)]
     pub notify: bool,
     pub sent_at: i64,
+    /// A person's signed answer to the request this replies to (`ask_user` with `about`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<Box<crate::team::Signed<Approval>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

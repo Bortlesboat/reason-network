@@ -27,12 +27,12 @@ fn payload<T: Serialize>(team: &str, kind: &str, body: &T) -> Vec<u8> {
 }
 
 impl<T: Serialize> Signed<T> {
-    fn new(body: T, key: &SecretKey, team: &str, kind: &str) -> Self {
+    pub(crate) fn new(body: T, key: &SecretKey, team: &str, kind: &str) -> Self {
         let sig = key.sign(&payload(team, kind, &body));
         Signed { by: key.public(), sig: HEXLOWER.encode(&sig.to_bytes()), body }
     }
 
-    fn verify(&self, team: &str, kind: &str) -> bool {
+    pub(crate) fn verify(&self, team: &str, kind: &str) -> bool {
         let Ok(bytes) = HEXLOWER.decode(self.sig.as_bytes()) else { return false };
         let Ok(arr) = <[u8; Signature::LENGTH]>::try_from(bytes.as_slice()) else { return false };
         self.by.verify(&payload(team, kind, &self.body), &Signature::from_bytes(&arr)).is_ok()
@@ -567,6 +567,38 @@ mod tests {
 
     fn key() -> SecretKey {
         SecretKey::generate()
+    }
+
+    #[test]
+    fn an_approvals_signature_covers_every_field_and_the_team() {
+        let k = key();
+        let approval = crate::proto::Approval {
+            about: "01REQ".into(),
+            asker: "alice/api".into(),
+            approver: "bob".into(),
+            approved: true,
+            question: "Rename the billing table?".into(),
+            request: "please rename billing".into(),
+            note: "ok".into(),
+            at: 1,
+        };
+        let signed = Signed::new(approval, &k, "acme", "approval");
+        assert!(signed.verify("acme", "approval"));
+        assert!(!signed.verify("other", "approval"));
+        assert!(!signed.verify("acme", "member"));
+        for change in [
+            |a: &mut crate::proto::Approval| a.about = "01OTHER".into(),
+            |a: &mut crate::proto::Approval| a.asker = "mallory/api".into(),
+            |a: &mut crate::proto::Approval| a.approved = false,
+            |a: &mut crate::proto::Approval| a.request = "drop the table".into(),
+        ] {
+            let mut forged = signed.clone();
+            change(&mut forged.body);
+            assert!(!forged.verify("acme", "approval"));
+        }
+        let mut wrong = signed.clone();
+        wrong.by = key().public();
+        assert!(!wrong.verify("acme", "approval"));
     }
 
     fn random_secret() -> String {

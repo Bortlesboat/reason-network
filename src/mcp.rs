@@ -65,6 +65,10 @@ pub struct SendArgs {
 pub struct AskArgs {
     /// What they need to decide: who asks for what, and why.
     pub question: String,
+    /// The id of the teammate's message you're asking about: your user sees it in the pop-up, and its sender gets
+    /// the answer signed by this machine.
+    #[serde(default)]
+    pub about: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -169,7 +173,7 @@ impl ReasonNetworkMcp {
             Ok(k) => k,
             Err(e) => return Ok(failure(e)),
         };
-        let req = Request::Ask { key: key.clone(), question: a.question };
+        let req = Request::Ask { key: key.clone(), question: a.question, about: a.about };
         let got = tokio::select! {
             r = self.link.call::<String>(req) => r,
             // The agent gave up on this call: the pop-up stays, and its answer comes as a message.

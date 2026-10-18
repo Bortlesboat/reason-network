@@ -228,6 +228,18 @@ pub fn for_agent(msgs: &[Message], agent: Option<&str>, cli: bool) -> String {
                 let _ = write!(attrs, " {k}=\"{}\"", attr(v));
             }
         }
+        // A teammate's own answer, signed by their machine and checked by this one when it arrived.
+        if let Some(a) = &m.approval {
+            let a = &a.body;
+            let said = if a.approved { "approved" } else { "said no to" };
+            let note = if a.note.is_empty() { String::new() } else { format!(" Their note: {}", a.note) };
+            let _ = writeln!(out, "<reason-approval from=\"{}\" about=\"{}\" verified>", attr(&m.from), attr(&a.about));
+            let text =
+                format!("{} {said} \"{}\" (the request they saw: \"{}\").{note}", a.approver, a.question, a.request);
+            out.push_str(&defang(&text));
+            out.push_str("\n</reason-approval>\n");
+            continue;
+        }
         let _ = writeln!(out, "<reason-message {attrs} id=\"{}\">", attr(&m.id));
         out.push_str(&defang(m.body.trim()));
         out.push_str("\n</reason-message>\n");
@@ -257,16 +269,20 @@ fn attr(v: &str) -> String {
 
 /// A message body that can't open or close a frame of its own, in any letter case.
 fn defang(body: &str) -> String {
+    ["reason-message", "reason-approval"].into_iter().fold(body.to_string(), |body, tag| defang_tag(&body, tag))
+}
+
+fn defang_tag(body: &str, tag_name: &str) -> String {
     let lower = body.to_ascii_lowercase();
+    let defanged = tag_name.replace('-', "_");
     let mut out = String::with_capacity(body.len());
     let mut i = 0;
-    const TAG: &str = "reason-message";
-    while let Some(off) = lower[i..].find(TAG) {
+    while let Some(off) = lower[i..].find(tag_name) {
         let at = i + off;
         let tag = lower[..at].ends_with('<') || lower[..at].ends_with("</");
         out.push_str(&body[i..at]);
-        out.push_str(if tag { "reason_message" } else { &body[at..at + TAG.len()] });
-        i = at + TAG.len();
+        out.push_str(if tag { &defanged } else { &body[at..at + tag_name.len()] });
+        i = at + tag_name.len();
     }
     out.push_str(&body[i..]);
     out
@@ -335,6 +351,7 @@ mod tests {
             wake: true,
             notify: false,
             sent_at: 0,
+            approval: None,
         };
         let out = for_agent(&[m], None, false);
         assert_eq!(out.matches("</reason-message>").count(), 1);

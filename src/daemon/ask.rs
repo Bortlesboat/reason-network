@@ -3,7 +3,11 @@
 //! with buttons on Linux.
 
 use super::{Daemon, MAX_WAIT, log, mail::unregistered};
-use crate::{proto::Message, util};
+use crate::{
+    proto::{Approval, Message},
+    team::Signed,
+    util,
+};
 use anyhow::{Result, anyhow, bail};
 use std::{process::Command, sync::Arc, time::Duration};
 use ulid::Ulid;
@@ -35,33 +39,49 @@ pub(super) struct Asking {
 impl Daemon {
     /// Asks this machine's person on behalf of the session `key`, and waits for the answer. A session has one
     /// question up at a time: asking it again waits for it, asking another is refused until it is answered. An answer
-    /// that comes once no call waits for it reaches the session as a message from its person.
-    pub(super) async fn ask(self: &Arc<Self>, key: String, question: String) -> Result<String> {
-        let (asker, stop) = {
+    /// that comes once no call waits for it reaches the session as a message from its person. `about`, a teammate's
+    /// message to this session, is shown with the question, and its sender gets the answer signed by this machine.
+    pub(super) async fn ask(self: &Arc<Self>, key: String, question: String, about: Option<String>) -> Result<String> {
+        let (asker, stop, request) = {
             let g = self.inner.lock().unwrap();
             let l = g.live.get(&key).ok_or_else(unregistered)?;
-            (self.addr(&l.name), l.stop_gen)
+            let asker = self.addr(&l.name);
+            let request = match about {
+                Some(id) => Some(
+                    g.store
+                        .message(&id)?
+                        .filter(|m| m.to == asker && !m.from.starts_with(&format!("{}/", self.person)))
+                        .ok_or_else(|| anyhow!("no message {id} from a teammate to this session"))?,
+                ),
+                None => None,
+            };
+            (asker, l.stop_gen, request)
         };
+        let shown = match &request {
+            Some(r) => format!("{question}\n\n{} asked: {}", r.from, util::one_line(&r.body, 300)),
+            None => question.clone(),
+        };
+        let signed_for = request.as_ref().map(|r| r.from.clone());
         {
             let mut asks = self.asks.lock().unwrap();
             match asks.get_mut(&key) {
-                Some(up) if up.question != question => bail!(
+                Some(up) if up.question != shown => bail!(
                     "your question \"{}\" is still up for {}: ask it again to keep waiting for its answer",
                     util::one_line(&up.question, 200),
                     self.person
                 ),
                 Some(up) => up.waiting += 1,
                 None => {
-                    let cmd = dialog(&format!("{asker} asks"), &question).ok_or_else(|| {
+                    let cmd = dialog(&format!("{asker} asks"), &shown).ok_or_else(|| {
                         anyhow!(
                             "{} has no screen to ask {} on: ask them in your own session",
                             self.machine,
                             self.person
                         )
                     })?;
-                    let up = Asking { question: question.clone(), waiting: 1, answer: None, taken: false };
+                    let up = Asking { question: shown, waiting: 1, answer: None, taken: false };
                     asks.insert(key.clone(), up);
-                    tokio::spawn(self.clone().pop_up(key.clone(), question, cmd));
+                    tokio::spawn(self.clone().pop_up(key.clone(), question, request, cmd));
                 }
             }
         }
@@ -74,7 +94,11 @@ impl Daemon {
             tokio::pin!(woke);
             woke.as_mut().enable();
             if let Some(answer) = waiting.take() {
-                return self.said(&answer);
+                let said = self.said(&answer)?;
+                return Ok(match (&signed_for, &answer) {
+                    (Some(to), Answer::Approved(_) | Answer::Denied(_)) => format!("{said} (Sent to {to}, signed.)"),
+                    _ => said,
+                });
             }
             let gave_up = self.inner.lock().unwrap().live.get(&key).is_none_or(|l| l.stop_gen != stop);
             if gave_up || tokio::time::Instant::now() >= deadline {
@@ -101,8 +125,9 @@ impl Daemon {
         })
     }
 
-    /// Shows the question until it is answered or closes, then hands the answer to the calls waiting for it.
-    async fn pop_up(self: Arc<Self>, key: String, question: String, cmd: Command) {
+    /// Shows the question until it is answered or closes, then hands the answer to the calls waiting for it (and, for
+    /// a teammate's request, to its sender).
+    async fn pop_up(self: Arc<Self>, key: String, question: String, request: Option<Message>, cmd: Command) {
         let mut cmd = tokio::process::Command::from(cmd);
         let out = tokio::time::timeout(Duration::from_secs(OPEN_SECS + 60), cmd.kill_on_drop(true).output()).await;
         let answer = match out {
@@ -114,16 +139,49 @@ impl Daemon {
         if let Answer::Failed(e) = &answer {
             log(&format!("pop-up failed: {e}"));
         }
-        let mut asks = self.asks.lock().unwrap();
-        let Some(up) = asks.get_mut(&key) else { return };
-        if up.waiting > 0 {
-            up.answer = Some(answer);
-            drop(asks);
+        let up = {
+            let mut asks = self.asks.lock().unwrap();
+            let Some(up) = asks.get_mut(&key) else { return };
+            let waited = up.waiting > 0;
+            if waited {
+                up.answer = Some(answer.clone());
+            } else {
+                asks.remove(&key);
+            }
+            waited
+        };
+        if up {
             self.arrived.notify_waiters();
         } else {
-            asks.remove(&key);
-            drop(asks);
             self.answer_later(&key, &question, &answer);
+        }
+        if let Some(request) = &request {
+            self.send_approval(&key, request, &question, &answer).await;
+        }
+    }
+
+    /// The person's answer to a teammate's request, signed by this machine, to the session that sent the request.
+    async fn send_approval(self: &Arc<Self>, key: &str, request: &Message, question: &str, answer: &Answer) {
+        let (approved, note) = match answer {
+            Answer::Approved(n) => (true, n),
+            Answer::Denied(n) => (false, n),
+            _ => return,
+        };
+        let (Some(team), Ok(said)) = (self.team_state(), self.said(answer)) else { return };
+        let approval = Approval {
+            about: request.id.clone(),
+            asker: request.from.clone(),
+            approver: self.person.clone(),
+            approved,
+            question: question.to_string(),
+            request: util::one_line(&request.body, 300),
+            note: note.clone(),
+            at: util::now_ms(),
+        };
+        let signed = Box::new(Signed::new(approval, &self.key, team.name(), "approval"));
+        let sent = self.send(key.into(), &request.from, &said, Some(request.id.clone()), true, false, Some(signed));
+        if let Err(e) = sent.await {
+            log(&format!("couldn't send {}'s answer to {}: {e}", self.person, request.from));
         }
     }
 
@@ -149,6 +207,7 @@ impl Daemon {
             wake: true,
             notify: false,
             sent_at: util::now_ms(),
+            approval: None,
         };
         if let Err(e) = g.store.insert(&msg, false) {
             return log(&format!("couldn't keep a late answer: {e}"));
