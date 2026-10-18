@@ -170,6 +170,7 @@ The hard part. Each session advertises a **delivery tier** so senders know when 
 | Gemini CLI | turn | `AfterTool` `additionalContext`; `AfterAgent` block. Idle: experimental background-shell inject. |
 | Copilot CLI | turn | `postToolUse` `additionalContext`; `agentStop` block; `notification` hook. |
 | Grok CLI | turn | `PostToolUse` `additionalContext`; `Stop` (`end_turn`) block. SessionStart and prompt-submit output are dropped; subagents' hooks are ignored. |
+| DeepSeek Harness | pull | MCP only: `setup` adds our server to `$DSH_HOME/cordis.patch.yml`, which dsh applies to every profile. |
 | any MCP client | pull | Tools + unread notice on every tool result + `check_inbox(wait_secs)` long-poll. |
 
 MCP notifications are not a delivery path: no client passes them to the model (checked Oct 2026).

@@ -677,6 +677,124 @@ fn pi(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     Ok(Some(r))
 }
 
+// ---- DeepSeek Harness (dsh) ----
+
+const DSH_BEGIN: &str = "# === reason-network MCP BEGIN ===";
+const DSH_END: &str = "# === reason-network MCP END ===";
+
+fn dsh_home() -> PathBuf {
+    std::env::var_os("DSH_HOME").filter(|h| !h.is_empty()).map(PathBuf::from).unwrap_or_else(|| home().join(".dsh"))
+}
+
+/// dsh applies this file on top of every profile, those made later too.
+fn dsh_patch() -> PathBuf {
+    dsh_home().join("cordis.patch.yml")
+}
+
+/// The binary's path as the block writes it: a YAML single-quoted string doubles its quotes.
+fn dsh_command(exe: &Path) -> String {
+    exe.display().to_string().replace('\'', "''")
+}
+
+/// Our MCP server as an entry of dsh's MCP client plugin. Tool calls get as long as `check_inbox(wait_secs)` may wait
+/// (dsh gives them one minute otherwise).
+fn dsh_block(exe: &Path) -> String {
+    let command = dsh_command(exe);
+    format!(
+        "{DSH_BEGIN}\n- insert:\n    - id: mcp-{AGENT_NAME}\n      name: '@deepseek-ai/dsh-mcp-client'\n      config:\n        \
+         serverName: {AGENT_NAME}\n        transport: stdio\n        command: '{command}'\n        args:\n          - mcp\n        \
+         env:\n          REASON_NETWORK_AGENT: dsh\n        toolCallTimeoutMs: 660000\n{DSH_END}\n"
+    )
+}
+
+fn dsh_wired(text: &str, exe: &Path) -> bool {
+    contains(text, &format!("serverName: {AGENT_NAME}")) && contains(text, &dsh_command(exe))
+}
+
+/// The lines of a patch file that are neither blank nor comments.
+fn dsh_entries(text: &str) -> Vec<&str> {
+    text.lines().filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#')).collect()
+}
+
+/// A patch file's text with `block` in it (in place of the one it has), or without ours when `remove`. `None`: nothing
+/// to change. dsh wants a top-level list (`- …` from the first column), so a file that is anything else is left
+/// alone, as is one with a server of that name the user wrote; both come back as an error saying so.
+fn dsh_patch_text(text: &str, block: &str, remove: bool) -> Result<Option<String>> {
+    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let block = block.replace('\n', eol);
+    let marked = text.find(DSH_BEGIN).and_then(|b| {
+        let e = b + text[b..].find(DSH_END)? + DSH_END.len();
+        let e = e + text[e..].chars().take_while(|c| matches!(c, '\r' | '\n')).take(eol.len()).count();
+        Some((b, e))
+    });
+    let new = match marked {
+        Some((b, e)) if remove => {
+            let before =
+                text[..b].strip_suffix(&format!("{eol}{eol}")).map_or(&text[..b], |s| &text[..s.len() + eol.len()]);
+            let rest = format!("{before}{}", &text[e..]);
+            if dsh_entries(&rest).is_empty() {
+                // Nothing but comments is not a list: dsh refuses to start on it.
+                let gap = if rest.is_empty() || rest.ends_with('\n') { "" } else { eol };
+                format!("{rest}{gap}[]{eol}")
+            } else {
+                rest
+            }
+        }
+        Some((b, e)) => format!("{}{block}{}", &text[..b], &text[e..]),
+        None if remove => return Ok(None),
+        None => {
+            if text.contains(&format!("serverName: {AGENT_NAME}")) {
+                return Err(anyhow!("it already has a {AGENT_NAME} MCP server of your own; left as is"));
+            }
+            let entries = dsh_entries(text);
+            match entries.first().copied() {
+                None => format!("{text}{}{block}", if text.is_empty() || text.ends_with('\n') { "" } else { eol }),
+                Some(first) if first.trim_end() == "[]" && entries.len() == 1 => {
+                    let rest: Vec<&str> = text.lines().filter(|l| l.trim_end() != "[]").collect();
+                    format!("{}{eol}{block}", rest.join(eol))
+                }
+                Some(first) if first.starts_with("- ") => {
+                    let gap = if text.ends_with('\n') { eol.to_string() } else { format!("{eol}{eol}") };
+                    format!("{text}{gap}{block}")
+                }
+                Some(_) => {
+                    return Err(anyhow!(
+                        "it isn't a top-level list of patch entries (`- …` from the first column); add the {AGENT_NAME} MCP entry yourself"
+                    ));
+                }
+            }
+        }
+    };
+    Ok((new != text).then_some(new))
+}
+
+fn dsh(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
+    if !dsh_home().exists() && agent::find_bin("dsh").is_none() {
+        return Ok(None);
+    }
+    let mut r = Report { agent: "DeepSeek Harness", lines: Vec::new(), notes: Vec::new() };
+    let path = dsh_patch();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    match dsh_patch_text(&text, &dsh_block(exe), remove) {
+        Ok(Some(new)) => {
+            r.lines.push(changed(&path, write_file(&path, &new, dry)?));
+            if !remove {
+                r.notes.push(
+                    "DeepSeek Harness reads Reason Network messages when it checks its inbox; start a new dsh session to load the MCP server."
+                        .into(),
+                );
+            }
+        }
+        Ok(None) => r.lines.push(changed(&path, false)),
+        Err(e) => r.notes.push(format!("DeepSeek Harness: {}: {e:#}", crate::util::tilde(&path.display().to_string()))),
+    }
+    Ok(Some(r))
+}
+
 // ---- Reason ----
 
 /// Reason's agent runs in its cloud: nothing to install there. The daemon lists your live Reason sessions and
@@ -1068,7 +1186,7 @@ fn me(exe: &Path) -> String {
     s[1..s.len() - 1].to_string()
 }
 
-const AGENTS: [Agent; 9] = [
+const AGENTS: [Agent; 10] = [
     Agent {
         id: "claude",
         name: "Claude Code",
@@ -1147,6 +1265,14 @@ const AGENTS: [Agent; 9] = [
         installed: || pi_home().exists() || agent::find_bin("pi").is_some(),
         wired: |_| pi_home().join(format!("extensions/{AGENT_NAME}.ts")).exists(),
         apply: pi,
+    },
+    Agent {
+        id: "dsh",
+        name: "DeepSeek Harness",
+        hint: "sees messages when it checks its inbox",
+        installed: || dsh_home().exists() || agent::find_bin("dsh").is_some(),
+        wired: |exe| std::fs::read_to_string(dsh_patch()).is_ok_and(|t| dsh_wired(&t, exe)),
+        apply: dsh,
     },
     Agent {
         id: "reason",
@@ -1262,7 +1388,7 @@ pub async fn run(dry: bool, remove: bool, no_service: bool) -> Result<()> {
     println!("{verb} ({}):", crate::util::tilde(&exe.display().to_string()));
     if found.is_empty() && !remove {
         println!(
-            "  no supported agents found (Claude Code, Codex, Grok CLI, Cursor, Gemini CLI, Copilot CLI, opencode, pi, Reason)"
+            "  no supported agents found (Claude Code, Codex, Grok CLI, Cursor, Gemini CLI, Copilot CLI, opencode, pi, DeepSeek Harness, Reason)"
         );
     }
     let ids: Vec<&str> = found.iter().map(|f| f.id).collect();
@@ -1369,6 +1495,65 @@ mod tests {
         merge_hook_groups(&mut hooks, "codex", vec![], true);
         assert_eq!(hooks["Stop"].as_array().unwrap().len(), 1);
         assert!(!hooks.contains_key("PostToolUse"));
+    }
+
+    const DSH_PATCH: &str = "# Your patch layer\n\n- id: agent-loop\n  config:\n    maxParallelToolCalls: 20\n";
+
+    #[test]
+    fn dsh_patch_gets_our_block_once_and_loses_it_again() {
+        let block = dsh_block(Path::new("/usr/local/bin/reason-network"));
+        let with = dsh_patch_text(DSH_PATCH, &block, false).unwrap().unwrap();
+        assert!(with.starts_with(DSH_PATCH) && with.contains(&block), "{with}");
+        assert_eq!(dsh_patch_text(&with, &block, false).unwrap(), None, "already there");
+        let moved = dsh_block(Path::new("/opt/reason-network"));
+        let updated = dsh_patch_text(&with, &moved, false).unwrap().unwrap();
+        assert!(updated.contains("/opt/reason-network") && !updated.contains("/usr/local/bin"), "{updated}");
+        assert_eq!(dsh_patch_text(&with, &block, true).unwrap().as_deref(), Some(DSH_PATCH), "removal restores it");
+        assert_eq!(dsh_patch_text(DSH_PATCH, &block, true).unwrap(), None, "nothing to remove");
+    }
+
+    #[test]
+    fn dsh_patch_stays_a_list_when_our_block_goes() {
+        let block = dsh_block(Path::new("/x/reason-network"));
+        // What dsh ships: comments and an empty list. Without the list dsh refuses to start.
+        let shipped = "# patch layer\n[]\n";
+        let with = dsh_patch_text(shipped, &block, false).unwrap().unwrap();
+        assert!(!with.contains("[]") && with.contains(&block), "{with}");
+        assert_eq!(dsh_patch_text(&with, &block, true).unwrap().as_deref(), Some(shipped));
+        // A file made for our block, or an empty one, goes back to an empty list as well.
+        let made = dsh_patch_text("", &block, false).unwrap().unwrap();
+        assert_eq!(made, block);
+        assert_eq!(dsh_patch_text(&made, &block, true).unwrap().as_deref(), Some("[]\n"));
+    }
+
+    #[test]
+    fn dsh_patch_only_takes_a_top_level_list() {
+        let block = dsh_block(Path::new("/x/reason-network"));
+        // Appending to any of these would leave a file dsh can't parse.
+        assert!(dsh_patch_text("  - id: a\n    name: b\n", &block, false).is_err(), "indented list");
+        assert!(dsh_patch_text("---\n[]\n", &block, false).is_err(), "document marker");
+        assert!(dsh_patch_text("agents: []\n", &block, false).is_err(), "a mapping");
+        let crlf = dsh_patch_text(&DSH_PATCH.replace('\n', "\r\n"), &block, false).unwrap().unwrap();
+        assert!(!crlf.replace("\r\n", "").contains('\n'), "line ends stay CRLF");
+    }
+
+    #[test]
+    fn dsh_patch_leaves_a_server_of_the_users_own_alone() {
+        let block = dsh_block(Path::new("/x/reason-network"));
+        let own = "- insert:\n    - id: my-rn\n      name: '@deepseek-ai/dsh-mcp-client'\n      config:\n        serverName: reason-network\n";
+        let why = dsh_patch_text(own, &block, false).unwrap_err().to_string();
+        assert!(why.contains("of your own"), "{why}");
+        assert_eq!(dsh_patch_text(own, &block, true).unwrap(), None, "`--remove` leaves it");
+    }
+
+    #[test]
+    fn dsh_wiring_is_found_through_the_yaml_quote() {
+        let exe = Path::new(r"C:\Users\O'Neil\reason-network.exe");
+        let block = dsh_block(exe);
+        assert!(block.contains(r"'C:\Users\O''Neil\reason-network.exe'"), "{block}");
+        assert!(dsh_wired(&block, exe));
+        assert!(!dsh_wired(&block, Path::new(r"C:\Users\other\reason-network.exe")));
+        assert!(!dsh_wired("", exe));
     }
 
     #[test]
