@@ -101,10 +101,15 @@ pub fn process(pid: u32) -> Option<(u32, String)> {
 
 /// Lowercase letters, digits and single dashes: a name that is safe in an address. Letters of other scripts are
 /// transliterated first (`José` -> `jose`, `代码` -> `dai-ma`), so the address stays plain ASCII, which every version
-/// accepts, and nothing but punctuation comes out empty.
+/// accepts, and nothing but punctuation comes out empty. A character it can't transliterate is a separator.
 pub fn slug(s: &str) -> String {
     let mut out = String::new();
-    for c in deunicode::deunicode(s).chars() {
+    // One character at a time, so a long name (teammates' names arrive up to megabytes long) costs no more than what is
+    // kept: one character can become up to 41.
+    for c in s.chars().flat_map(|c| deunicode::deunicode_char(c).unwrap_or(" ").chars()) {
+        if out.len() > 40 {
+            break;
+        }
         if c.is_ascii_alphanumeric() {
             out.push(c.to_ascii_lowercase());
         } else if !out.is_empty() && !out.ends_with('-') {
@@ -273,6 +278,21 @@ mod tests {
         // What was already a slug stays one, so names saved by an older version don't change.
         assert_eq!(slug("sams-macbook-pro"), "sams-macbook-pro");
         assert_eq!(slug("v2"), "v2");
+        // Only symbols: still empty, however they are written.
+        assert_eq!(slug("!@#$%^&*()"), "");
+        assert_eq!(slug("“—…”"), "");
+    }
+
+    #[test]
+    fn a_long_name_of_wide_characters_costs_what_is_kept() {
+        // Teammates' names arrive through `slug` too, and one character can become many letters.
+        let started = std::time::Instant::now();
+        let s = slug(&"龘".repeat(1 << 20));
+        assert_eq!(s.len(), 40, "{s}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "slowed by input it never keeps");
+        // The cut is the same as slugging everything first.
+        let long = "api ".repeat(100);
+        assert_eq!(slug(&long), long.trim().replace(' ', "-").chars().take(40).collect::<String>());
     }
 
     #[test]
