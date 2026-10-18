@@ -61,10 +61,10 @@ impl Daemon {
         // A teammate's request comes first, in their words (cut only where it ends in "…"), and the agent's question gets
         // the room left: the request the person sees is the one the signed answer says they saw.
         let request = request.map(|m| {
-            let text = clip(&util::one_line(&m.body, 2000), 500);
+            let text = clip(&plain(&util::one_line(&m.body, 2000)), 500);
             (m, text)
         });
-        let question = clip(&question, if request.is_some() { 400 } else { 900 });
+        let question = clip(&plain(&question), if request.is_some() { 400 } else { 900 });
         let asked = request.as_ref().map_or(String::new(), |(m, text)| format!("{} asked: {text}", m.from));
         let popup = if asked.is_empty() { question.clone() } else { format!("{asked}\n\nYour agent asks: {question}") };
         {
@@ -375,6 +375,16 @@ fn dialog(title: &str, request: &str, question: &str) -> Option<Command> {
     Some(cmd)
 }
 
+/// Text as the person should see it: without direction overrides, invisible spacers or tag characters, which could make
+/// what shows differ from what is there (joiners stay, for emoji and scripts that need them).
+fn plain(text: &str) -> String {
+    let hides = |c: &char| {
+        matches!(c, '\u{61C}' | '\u{200B}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}')
+            || matches!(c, '\u{FEFF}' | '\u{E0000}'..='\u{E007F}')
+    };
+    text.chars().filter(|c| !hides(c)).collect()
+}
+
 /// At most `max` characters of `text`, marked where it is cut.
 fn clip(text: &str, max: usize) -> String {
     let t = util::printable(text).trim().to_string();
@@ -429,13 +439,15 @@ $f.Text = $env:TINCAN_TITLE; $f.TopMost = $true; $f.StartPosition = 'CenterScree
 $f.MinimizeBox = $false; $f.MaximizeBox = $false; $f.AutoSize = $true; $f.AutoSizeMode = 'GrowAndShrink'; $f.Padding = 12
 $l = New-Object Windows.Forms.FlowLayoutPanel; $l.FlowDirection = 'TopDown'; $l.AutoSize = $true
 $q = New-Object Windows.Forms.Label; $q.UseMnemonic = $false; $q.UseCompatibleTextRendering = $false; $q.AutoSize = $true; $q.MaximumSize = '420,320'
-$R = [Globalization.StringInfo]::new([string]$env:TINCAN_REQUEST); $Q = [Globalization.StringInfo]::new([string]$env:TINCAN_QUESTION)
-$r = $R.LengthInTextElements; $n = $Q.LengthInTextElements
+$req = [Globalization.StringInfo]::new([string]$env:TINCAN_REQUEST); $ask = [Globalization.StringInfo]::new([string]$env:TINCAN_QUESTION)
+$reqShown = $req.LengthInTextElements; $askShown = $ask.LengthInTextElements
 $cut = { param($s, $k) if ($k -ge $s.LengthInTextElements) { $s.String } elseif ($k -le 0) { [string][char]0x2026 } else { $s.SubstringByTextElements(0, $k).TrimEnd() + [char]0x2026 } }
-$text = { if ($R.String) { (& $cut $R $r) + "`n`nYour agent asks: " + (& $cut $Q $n) } else { & $cut $Q $n } }
+$text = { if ($req.String) { (& $cut $req $reqShown) + "`n`nYour agent asks: " + (& $cut $ask $askShown) } else { & $cut $ask $askShown } }
 $q.Text = & $text
-while ([Windows.Forms.TextRenderer]::MeasureText($q.Text, $q.Font, '420,0', 'WordBreak').Height -gt 320 -and ($r + $n) -gt 0) {
-  if ($n -gt 0) { $n = [Math]::Max(0, $n - 20) } else { $r = [Math]::Max(0, $r - 20) }
+# Measured the way the label lays it out.
+$fits = { $m = New-Object Windows.Forms.Label; $m.UseMnemonic = $false; $m.UseCompatibleTextRendering = $false; $m.Font = $q.Font; $m.Text = $q.Text; $m.GetPreferredSize('420,0').Height -le 320 }
+while (-not (& $fits) -and ($reqShown + $askShown) -gt 0) {
+  if ($askShown -gt 0) { $askShown = [Math]::Max(0, $askShown - 20) } else { $reqShown = [Math]::Max(0, $reqShown - 20) }
   $q.Text = & $text
 }
 $note = New-Object Windows.Forms.TextBox; $note.Width = 420
@@ -448,10 +460,27 @@ $yes.Add_Click({ $script:choice = 'approve'; $script:said = $note.Text; $f.Close
 $no.Add_Click({ $script:choice = 'deny'; $script:said = $note.Text; $f.Close() })
 $t = New-Object Windows.Forms.Timer; $t.Interval = [int]$env:TINCAN_SECS * 1000; $t.Add_Tick({ $f.Close() }); $t.Start()
 [Windows.Forms.Application]::Run($f)
-if ($script:choice) { "$($script:choice)`n$r`n$($script:said)" }"#;
+if ($script:choice) { "$($script:choice)`n$reqShown`n$($script:said)" }"#;
     let powershell = asker_bin("powershell", &[r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"])?;
     let mut cmd = super::notify::powershell_at(powershell, PANEL);
     cmd.env("TINCAN_TITLE", title).env("TINCAN_REQUEST", request).env("TINCAN_QUESTION", question);
     cmd.env("TINCAN_SECS", OPEN_SECS.to_string());
     Some(cmd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn what_shows_is_what_is_there() {
+        // A direction override can't turn text around, nor a spacer or tag character hide in it; joiners stay.
+        let family = "\u{1F468}\u{200D}\u{1F469}";
+        assert_eq!(
+            plain(&format!("rename \u{202E}dorp\u{202C} it\u{200B}\u{E0041} {family}")),
+            format!("rename dorp it {family}")
+        );
+        assert_eq!(clip("abcdef", 3), "abc…");
+        assert_eq!(clip("abc", 3), "abc");
+    }
 }

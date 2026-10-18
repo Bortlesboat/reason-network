@@ -201,17 +201,18 @@ Three tools, none of which an agent has to call unless it wants to message someo
   agent asks in its own session. With `about` (the id of a teammate's message to this session), the pop-up shows that
   request first, in its sender's words (up to 500 characters, marked where cut), then the agent's question in the room
   left (a panel cuts the question first and the request only after it, and says how much of the request it showed; a
-  Linux notification shows what its server shows); the answer also goes to the request's sender, from the asking
-  session or the person's terminal if it has gone, as an `Approval` holding what was shown (the request's id and
-  sender, the approver, the decision, the request, the question, the note, the time), signed with this machine's key
-  like the team's own entries. The receiving machine keeps it only if the machine that sent it signed it, as its own
-  person, for the session it arrived at; anything else is dropped, and the message says it didn't verify. Which
-  request it answers is the approver's machine's word, so agents see `<reason-approval from=… about=… verified>` and
-  check `from` is the person they asked and `about` their request; older machines see the plain text. It proves the
-  approver's machine recorded its person's answer: an agent can't write one, and release builds use only the system's
-  own dialog programs, which keeps an agent from simply starting the engine with a stand-in that answers. That is a
-  speed bump, not a guarantee: software that controls the approver's machine can still sign (the machine's key is a
-  file there, and it could build its own engine).
+  Linux notification shows what its server shows; direction overrides and invisible characters are left out of what's
+  shown and signed, though glyphs drawn over each other can still hide text the panel laid out); the answer also goes
+  to the request's sender, from the asking session or the person's terminal if it has gone, as an `Approval` holding
+  what was shown (the request's id and sender, the approver, the decision, the request, the question, the note, the
+  time), signed with this machine's key like the team's own entries. The receiving machine keeps it only if the
+  machine that sent it signed it, as its own person, for the session it arrived at; anything else is dropped, and the
+  message says it didn't verify. Which request it answers is the approver's machine's word, so agents see
+  `<reason-approval from=… about=… verified>` and check `from` is the person they asked and `about` their request;
+  older machines see the plain text. It proves the approver's machine recorded its person's answer: an agent can't
+  write one, and release builds use only the system's own dialog programs, which keeps an agent from simply starting
+  the engine with a stand-in that answers. That is a speed bump, not a guarantee: software that controls the
+  approver's machine can still sign (the machine's key is a file there, and it could build its own engine).
 
 Agents never report what they are doing; Reason Network reads it from what they record anyway (`doing.rs`): the
 session's title (Claude Code's `ai-title` transcript entries, Codex's thread names in
