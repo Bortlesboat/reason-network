@@ -72,8 +72,9 @@ async fn handle(
         ("doing", _) => "doing",
         _ => return None,
     };
-    // Prompt-submit hooks in Cursor and Copilot can't add context, and opencode's status call shows nothing.
-    let mail = !matches!((agent, event), ("cursor" | "copilot", "user-prompt-submit") | (_, "status" | "doing"));
+    // Prompt-submit hooks in Cursor, Copilot and grok can't add context, and opencode's status call shows nothing.
+    let mail =
+        !matches!((agent, event), ("cursor" | "copilot" | "grok", "user-prompt-submit") | (_, "status" | "doing"));
 
     let key = format!("{agent}:{session_id}");
     let req = Request::Hook(HookCall {
@@ -111,10 +112,12 @@ fn format_for(agent: &str, event: &str, ev: &str, text: &str) -> String {
         ("codex", "start") => specific("SessionStart"),
         ("codex", "prompt") => specific("UserPromptSubmit"),
         ("codex", "tool") => specific("PostToolUse"),
+        ("grok", "start") => specific("SessionStart"),
+        ("grok", "tool") => specific("PostToolUse"),
         ("gemini", "start") => specific("SessionStart"),
         ("gemini", "prompt") => specific("BeforeAgent"),
         ("gemini", "tool") => specific("AfterTool"),
-        ("codex" | "gemini" | "copilot", "stop") => block(),
+        ("codex" | "gemini" | "copilot" | "grok", "stop") => block(),
         ("cursor", "stop") => json!({ "followup_message": text }),
         ("cursor", _) => json!({ "additional_context": text }),
         ("copilot", _) => json!({ "additionalContext": text }),
@@ -149,6 +152,9 @@ mod tests {
         assert_eq!(format_for("cursor", "post-tool-use", "tool", "hi"), r#"{"additional_context":"hi"}"#);
         assert_eq!(format_for("copilot", "session-start", "start", "hi"), r#"{"additionalContext":"hi"}"#);
         assert!(format_for("gemini", "user-prompt-submit", "prompt", "hi").contains("BeforeAgent"));
+        assert!(format_for("grok", "post-tool-use", "tool", "hi").contains("\"PostToolUse\""));
+        assert!(format_for("grok", "session-start", "start", "hi").contains("\"SessionStart\""));
+        assert_eq!(format_for("grok", "stop", "stop", "hi"), r#"{"decision":"block","reason":"hi"}"#);
         assert_eq!(format_for("opencode", "poll", "stop", "hi"), "hi");
     }
 }

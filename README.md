@@ -8,7 +8,7 @@ One small daemon per computer. Peer to peer, no server. Messages land straight i
 
 Every coding agent session on every teammate's computer shows up (who, which repo and branch, busy or idle, what it's
 doing right now), and any of them can message the right one: Claude Code, Codex, Cursor, Gemini CLI, Copilot CLI,
-opencode, pi and Reason.
+Grok CLI, opencode, pi and Reason.
 
 ## Get started
 

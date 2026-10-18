@@ -351,6 +351,81 @@ fn codex(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     Ok(Some(r))
 }
 
+// ---- Grok CLI ----
+
+fn grok_home() -> PathBuf {
+    std::env::var_os("GROK_HOME").map(PathBuf::from).unwrap_or_else(|| home().join(".grok"))
+}
+
+/// grok reads the MCP server from `config.toml` and Claude-Code-style hook groups from `hooks/*.json` (global hook
+/// files are always trusted, so no prompt).
+fn grok(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
+    let dir = grok_home();
+    if agent::find_bin("grok").is_none() && !dir.exists() {
+        return Ok(None);
+    }
+    let mut r = Report { agent: "Grok CLI", lines: Vec::new(), notes: Vec::new() };
+
+    let cfg_path = dir.join("config.toml");
+    let text = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+    let mut doc: toml_edit::DocumentMut = text.parse().with_context(|| format!("parsing {}", cfg_path.display()))?;
+    if remove {
+        if let Some(servers) = doc.get_mut("mcp_servers").and_then(|t| t.as_table_like_mut()) {
+            servers.remove(AGENT_NAME);
+        }
+    } else {
+        let servers = doc.entry("mcp_servers").or_insert(toml_edit::table());
+        if let Some(t) = servers.as_table_mut() {
+            t.set_implicit(true);
+        }
+        let mut t = toml_edit::Table::new();
+        t["command"] = toml_edit::value(exe.display().to_string());
+        t["args"] = toml_edit::value(toml_edit::Array::from_iter(["mcp"]));
+        let mut env = toml_edit::InlineTable::new();
+        env.insert("REASON_NETWORK_AGENT", "grok".into());
+        if let Ok(h) = crate::paths::env_var("HOME") {
+            env.insert("REASON_NETWORK_HOME", h.into());
+        }
+        t["env"] = toml_edit::value(env);
+        t["enabled"] = toml_edit::value(true);
+        // Room for check_inbox(wait_secs) long-polls.
+        t["tool_timeout_sec"] = toml_edit::value(660);
+        servers[AGENT_NAME] = toml_edit::Item::Table(t);
+    }
+    r.lines.push(changed(&cfg_path, write_file(&cfg_path, &doc.to_string(), dry)?));
+
+    let hooks_path = dir.join(format!("hooks/{AGENT_NAME}.json"));
+    let mut v = read_json(&hooks_path)?;
+    // Stop and PostToolUse default to a 10 minute timeout in grok; the others to 5 seconds.
+    let group = |event: &str, matcher: bool, timeout: u64| {
+        let mut g = json!({ "hooks": [{ "type": "command", "command": shell_cmd(exe, &format!("hook grok {event}")), "timeout": timeout }] });
+        if matcher {
+            g["matcher"] = json!("*");
+        }
+        g
+    };
+    let groups = vec![
+        ("SessionStart", group("session-start", false, 10)),
+        ("UserPromptSubmit", group("user-prompt-submit", false, 10)),
+        ("PostToolUse", group("post-tool-use", true, 10)),
+        ("Stop", group("stop", false, 10)),
+        ("SessionEnd", group("session-end", false, 3)),
+    ];
+    merge_hook_groups(obj(obj(&mut v)?.entry("hooks").or_insert_with(|| json!({})))?, "grok", groups, remove);
+    if remove && hollow(&v) {
+        if hooks_path.exists() {
+            if !dry {
+                std::fs::remove_file(&hooks_path)?;
+            }
+            r.lines.push(format!("removed {}", crate::util::tilde(&hooks_path.display().to_string())));
+        }
+    } else {
+        let did = write_json(&hooks_path, &v, dry)?;
+        r.lines.push(changed(&hooks_path, did));
+    }
+    Ok(Some(r))
+}
+
 // ---- Cursor ----
 
 fn cursor(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
@@ -936,7 +1011,7 @@ fn me(exe: &Path) -> String {
     s[1..s.len() - 1].to_string()
 }
 
-const AGENTS: [Agent; 8] = [
+const AGENTS: [Agent; 9] = [
     Agent {
         id: "claude",
         name: "Claude Code",
@@ -964,6 +1039,17 @@ const AGENTS: [Agent; 8] = [
                 && has(codex_home().join("hooks.json"), "hook codex")
         },
         apply: codex,
+    },
+    Agent {
+        id: "grok",
+        name: "Grok CLI",
+        hint: "at its next step or end of turn",
+        installed: || agent::find_bin("grok").is_some() || grok_home().exists(),
+        wired: |exe| {
+            has(grok_home().join("config.toml"), &exe.display().to_string())
+                && has(grok_home().join(format!("hooks/{AGENT_NAME}.json")), "hook grok")
+        },
+        apply: grok,
     },
     Agent {
         id: "cursor",
@@ -1119,7 +1205,7 @@ pub async fn run(dry: bool, remove: bool, no_service: bool) -> Result<()> {
     println!("{verb} ({}):", crate::util::tilde(&exe.display().to_string()));
     if found.is_empty() && !remove {
         println!(
-            "  no supported agents found (Claude Code, Codex, Cursor, Gemini CLI, Copilot CLI, opencode, pi, Reason)"
+            "  no supported agents found (Claude Code, Codex, Grok CLI, Cursor, Gemini CLI, Copilot CLI, opencode, pi, Reason)"
         );
     }
     let ids: Vec<&str> = found.iter().map(|f| f.id).collect();
