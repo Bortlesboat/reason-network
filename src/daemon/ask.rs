@@ -64,29 +64,27 @@ impl Daemon {
             let text = clip(&util::one_line(&m.body, 2000), 500);
             (m, text)
         });
-        let question = if request.is_some() { clip(&question, 400) } else { question };
-        let shown = match &request {
-            Some((m, text)) => format!("{} asked: {text}\n\nYour agent asks: {question}", m.from),
-            None => question.clone(),
-        };
+        let question = clip(&question, if request.is_some() { 400 } else { 900 });
+        let asked = request.as_ref().map_or(String::new(), |(m, text)| format!("{} asked: {text}", m.from));
+        let popup = if asked.is_empty() { question.clone() } else { format!("{asked}\n\nYour agent asks: {question}") };
         {
             let mut asks = self.asks.lock().unwrap();
             match asks.get_mut(&key) {
-                Some(up) if up.question != shown => bail!(
+                Some(up) if up.question != popup => bail!(
                     "your question \"{}\" is still up for {}: ask it again to keep waiting for its answer",
                     util::one_line(&up.question, 200),
                     self.person
                 ),
                 Some(up) => up.waiting += 1,
                 None => {
-                    let cmd = dialog(&format!("{asker} asks"), &shown).ok_or_else(|| {
+                    let cmd = dialog(&format!("{asker} asks"), &asked, &question).ok_or_else(|| {
                         anyhow!(
                             "{} has no screen to ask {} on: ask them in your own session",
                             self.machine,
                             self.person
                         )
                     })?;
-                    let up = Asking { question: shown, waiting: 1, answer: None, taken: false };
+                    let up = Asking { question: popup, waiting: 1, answer: None, taken: false };
                     asks.insert(key.clone(), up);
                     tokio::spawn(self.clone().pop_up(key.clone(), question, request, cmd));
                 }
@@ -133,18 +131,18 @@ impl Daemon {
     async fn pop_up(self: Arc<Self>, key: String, question: String, request: Option<(Message, String)>, cmd: Command) {
         let mut cmd = tokio::process::Command::from(cmd);
         let out = tokio::time::timeout(Duration::from_secs(OPEN_SECS + 60), cmd.kill_on_drop(true).output()).await;
-        let answer = match out {
+        let (answer, shown) = match out {
             Ok(Ok(o)) if o.status.success() => parse(&String::from_utf8_lossy(&o.stdout)),
-            Ok(Ok(o)) => Answer::Failed(String::from_utf8_lossy(&o.stderr).trim().to_string()),
-            Ok(Err(e)) => Answer::Failed(e.to_string()),
-            Err(_) => Answer::Unanswered,
+            Ok(Ok(o)) => (Answer::Failed(String::from_utf8_lossy(&o.stderr).trim().to_string()), None),
+            Ok(Err(e)) => (Answer::Failed(e.to_string()), None),
+            Err(_) => (Answer::Unanswered, None),
         };
         if let Answer::Failed(e) = &answer {
             log(&format!("pop-up failed: {e}"));
         }
         // The teammate's answer goes first, so the calls waiting can say whether it went.
         let receipt = match &request {
-            Some((m, text)) => self.send_approval(&key, m, text, &question, &answer).await,
+            Some((m, text)) => self.send_approval(&key, m, text, shown, &question, &answer).await,
             None => String::new(),
         };
         let waited = {
@@ -171,7 +169,8 @@ impl Daemon {
         self: &Arc<Self>,
         key: &str,
         request: &Message,
-        shown: &str,
+        text: &str,
+        shown: Option<usize>,
         question: &str,
         answer: &Answer,
     ) -> String {
@@ -181,13 +180,19 @@ impl Daemon {
             _ => return String::new(),
         };
         let (Some(team), Ok(said)) = (self.team_state(), self.said(answer)) else { return String::new() };
+        // As much of the request as the person was shown: a panel says how much (after the "<from> asked: " it starts
+        // with); a notification shows what it shows.
+        let seen = match shown {
+            Some(n) => clip(text, n.saturating_sub(format!("{} asked: ", request.from).chars().count())),
+            None => text.to_string(),
+        };
         let approval = Approval {
             about: request.id.clone(),
             asker: request.from.clone(),
             approver: self.person.clone(),
             approved,
             question: question.to_string(),
-            request: shown.to_string(),
+            request: seen,
             note: clip(note, 500),
             at: util::now_ms(),
         };
@@ -289,35 +294,48 @@ impl Drop for Waiting<'_> {
     }
 }
 
-/// `approve` or `deny` on the first line, the note after it; anything else is no answer.
-fn parse(out: &str) -> Answer {
-    let (choice, note) = out.trim().split_once('\n').unwrap_or((out.trim(), ""));
-    let note = note.trim().to_string();
-    match choice.trim().to_lowercase().as_str() {
+/// The button on the first line (`approve` or `deny`); from a panel, how much of the request it showed (characters) on
+/// the second, then the note. Anything else is no answer.
+fn parse(out: &str) -> (Answer, Option<usize>) {
+    let mut lines = out.trim().splitn(3, '\n');
+    let choice = lines.next().unwrap_or_default().trim().to_lowercase();
+    // A panel (macOS, Windows) that doesn't say how much of the request it showed showed none of it.
+    let shown =
+        cfg!(any(target_os = "macos", windows)).then(|| lines.next().and_then(|l| l.trim().parse().ok()).unwrap_or(0));
+    let note = lines.next().unwrap_or_default().trim().to_string();
+    let answer = match choice.as_str() {
         "approve" => Answer::Approved(note),
         "deny" => Answer::Denied(note),
         _ => Answer::Unanswered,
-    }
+    };
+    (answer, shown)
 }
 
 /// A floating panel with a note box, Deny (Escape) and Approve (Return). It shows on top without taking the keyboard,
-/// so nothing typed elsewhere reaches it; it gets keys once clicked, in the note box. Prints the button and the note;
-/// nothing if it closed unanswered.
+/// so nothing typed elsewhere reaches it; it gets keys once clicked, in the note box. A teammate's request comes first:
+/// what doesn't fit is cut from the question, and only then from the request. Prints the button, how much of the request
+/// showed (characters), and the note; nothing if it closed unanswered.
 #[cfg(target_os = "macos")]
 const PANEL: &str = r#"ObjC.import("Cocoa")
-function run([title, question, secs, icon]) {
+function run([title, request, question, secs, icon]) {
   const app = $.NSApplication.sharedApplication
   app.setActivationPolicy($.NSApplicationActivationPolicyAccessory)
-  let choice = ""
+  let answer = null
   ObjC.registerSubclass({ name: "Answer", methods: {
-    "approve:": { types: ["void", ["id"]], implementation: () => { choice = `approve\n${note.stringValue.js}`; app.stop(null) } },
-    "deny:": { types: ["void", ["id"]], implementation: () => { choice = `deny\n${note.stringValue.js}`; app.stop(null) } },
+    "approve:": { types: ["void", ["id"]], implementation: () => { answer = ["approve", note.stringValue.js]; app.stop(null) } },
+    "deny:": { types: ["void", ["id"]], implementation: () => { answer = ["deny", note.stringValue.js]; app.stop(null) } },
   } })
-  const answer = $.Answer.alloc.init
-  const label = $.NSTextField.wrappingLabelWithString(question)
+  const target = $.Answer.alloc.init
+  const [rs, qs] = [Array.from(request), Array.from(question)]
+  let [r, q] = [rs.length, qs.length]
+  const cut = (s, n) => s.slice(0, n).join("").trimEnd() + (n < s.length ? "…" : "")
+  const text = () => (request ? `${cut(rs, r)}\n\nYour agent asks: ` : "") + cut(qs, q)
+  const label = $.NSTextField.wrappingLabelWithString(text())
   label.preferredMaxLayoutWidth = 330
-  // A question too long to show whole ends in "…" where the panel cuts it.
-  for (let n = question.length; label.fittingSize.height > 320 && n > 0; n -= 20) label.stringValue = question.slice(0, n).trimEnd() + "…"
+  while (label.fittingSize.height > 320 && r + q > 0) {
+    if (q > 0) q = Math.max(0, q - 20); else r = Math.max(0, r - 20)
+    label.stringValue = text()
+  }
   const h = Math.max(label.fittingSize.height, 48)
   // Titled, non-activating: it doesn't take the keyboard from the app in front.
   const panel = $.NSPanel.alloc.initWithContentRectStyleMaskBackingDefer($.NSMakeRect(0, 0, 440, h + 96), 1 | 128, 2, false)
@@ -331,12 +349,12 @@ function run([title, question, secs, icon]) {
   if (image && !image.isNil()) put($.NSImageView.imageViewWithImage(image), 20, h + 28, 48, 48)
   const note = $.NSTextField.alloc.init
   note.placeholderString = "Note (optional)"
-  note.target = answer
+  note.target = target
   note.action = "approve:"
   put(note, 86, 48, 330, 24)
   panel.initialFirstResponder = note
   const button = (name, x, action, key) => {
-    const b = $.NSButton.buttonWithTitleTargetAction(name, answer, action)
+    const b = $.NSButton.buttonWithTitleTargetAction(name, target, action)
     b.keyEquivalent = key
     put(b, x, 10, 96, 30)
   }
@@ -346,14 +364,14 @@ function run([title, question, secs, icon]) {
   panel.orderFrontRegardless
   $.NSTimer.scheduledTimerWithTimeIntervalTargetSelectorUserInfoRepeats(Number(secs), app, "stop:", null, false)
   app.run
-  return choice
+  return answer ? `${answer[0]}\n${r}\n${answer[1]}` : ""
 }"#;
 
 #[cfg(target_os = "macos")]
-fn dialog(title: &str, question: &str) -> Option<Command> {
+fn dialog(title: &str, request: &str, question: &str) -> Option<Command> {
     let mut cmd = Command::new(asker_bin("osascript", &["/usr/bin/osascript"])?);
     let icon = icon().map(|p| p.display().to_string()).unwrap_or_default();
-    cmd.args(["-l", "JavaScript", "-e", PANEL, title, &clip(question, 900), &OPEN_SECS.to_string(), &icon]);
+    cmd.args(["-l", "JavaScript", "-e", PANEL, title, request, question, &OPEN_SECS.to_string(), &icon]);
     Some(cmd)
 }
 
@@ -386,20 +404,22 @@ fn icon() -> Option<std::path::PathBuf> {
 /// A notification with buttons: notify-send prints the one clicked, or nothing if it was closed or expired.
 /// (`--wait` and `--action` need libnotify 0.7.10, from 2021; with an older one asking fails, and says so.)
 #[cfg(all(unix, not(target_os = "macos")))]
-fn dialog(title: &str, question: &str) -> Option<Command> {
+fn dialog(title: &str, request: &str, question: &str) -> Option<Command> {
     use super::notify::{markup, notify_send_at};
+    let body =
+        if request.is_empty() { question.to_string() } else { format!("{request}\n\nYour agent asks: {question}") };
     let mut cmd =
         notify_send_at(asker_bin("notify-send", &["/usr/bin/notify-send", "/run/current-system/sw/bin/notify-send"])?)?;
     cmd.args(["--app-name=Reason Network", "--wait", "--action=approve=Approve", "--action=deny=Deny"])
         .arg(format!("--expire-time={}", OPEN_SECS * 1000))
-        .args(["--".into(), markup(title), markup(question)]);
+        .args(["--".into(), markup(title), markup(&body)]);
     Some(cmd)
 }
 
 /// The same panel as on macOS: shown on top without taking the keyboard (once clicked into, Return approves and Escape
-/// denies); prints the button and the note.
+/// denies), the request first; prints the button, how much of the request showed, and the note.
 #[cfg(windows)]
-fn dialog(title: &str, question: &str) -> Option<Command> {
+fn dialog(title: &str, request: &str, question: &str) -> Option<Command> {
     const PANEL: &str = r#"$ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
@@ -408,22 +428,30 @@ $f = New-Object AskPanel
 $f.Text = $env:TINCAN_TITLE; $f.TopMost = $true; $f.StartPosition = 'CenterScreen'; $f.FormBorderStyle = 'FixedDialog'
 $f.MinimizeBox = $false; $f.MaximizeBox = $false; $f.AutoSize = $true; $f.AutoSizeMode = 'GrowAndShrink'; $f.Padding = 12
 $l = New-Object Windows.Forms.FlowLayoutPanel; $l.FlowDirection = 'TopDown'; $l.AutoSize = $true
-$q = New-Object Windows.Forms.Label; $q.UseMnemonic = $false; $q.UseCompatibleTextRendering = $false; $q.Text = $env:TINCAN_BODY; $q.AutoSize = $true; $q.MaximumSize = '420,320'
-# A question too long to show whole ends in "…" where the panel cuts it.
-$s = $q.Text; while ([Windows.Forms.TextRenderer]::MeasureText($q.Text, $q.Font, '420,0', 'WordBreak').Height -gt 320 -and $s) { $s = $s.Substring(0, [Math]::Max(0, $s.Length - 20)).TrimEnd(); $q.Text = $s + [char]0x2026 }
+$q = New-Object Windows.Forms.Label; $q.UseMnemonic = $false; $q.UseCompatibleTextRendering = $false; $q.AutoSize = $true; $q.MaximumSize = '420,320'
+$R = [Globalization.StringInfo]::new([string]$env:TINCAN_REQUEST); $Q = [Globalization.StringInfo]::new([string]$env:TINCAN_QUESTION)
+$r = $R.LengthInTextElements; $n = $Q.LengthInTextElements
+$cut = { param($s, $k) if ($k -ge $s.LengthInTextElements) { $s.String } elseif ($k -le 0) { [string][char]0x2026 } else { $s.SubstringByTextElements(0, $k).TrimEnd() + [char]0x2026 } }
+$text = { if ($R.String) { (& $cut $R $r) + "`n`nYour agent asks: " + (& $cut $Q $n) } else { & $cut $Q $n } }
+$q.Text = & $text
+while ([Windows.Forms.TextRenderer]::MeasureText($q.Text, $q.Font, '420,0', 'WordBreak').Height -gt 320 -and ($r + $n) -gt 0) {
+  if ($n -gt 0) { $n = [Math]::Max(0, $n - 20) } else { $r = [Math]::Max(0, $r - 20) }
+  $q.Text = & $text
+}
 $note = New-Object Windows.Forms.TextBox; $note.Width = 420
 $b = New-Object Windows.Forms.FlowLayoutPanel; $b.FlowDirection = 'RightToLeft'; $b.Width = 420; $b.Height = 34
 $yes = New-Object Windows.Forms.Button; $yes.Text = 'Approve'; $no = New-Object Windows.Forms.Button; $no.Text = 'Deny'
 $b.Controls.AddRange(@($yes, $no)); $l.Controls.AddRange(@($q, $note, $b)); $f.Controls.Add($l)
 $f.AcceptButton = $yes; $f.CancelButton = $no; $f.ActiveControl = $note
 $script:choice = ''
-$yes.Add_Click({ $script:choice = "approve`n" + $note.Text; $f.Close() })
-$no.Add_Click({ $script:choice = "deny`n" + $note.Text; $f.Close() })
+$yes.Add_Click({ $script:choice = 'approve'; $script:said = $note.Text; $f.Close() })
+$no.Add_Click({ $script:choice = 'deny'; $script:said = $note.Text; $f.Close() })
 $t = New-Object Windows.Forms.Timer; $t.Interval = [int]$env:TINCAN_SECS * 1000; $t.Add_Tick({ $f.Close() }); $t.Start()
 [Windows.Forms.Application]::Run($f)
-$script:choice"#;
+if ($script:choice) { "$($script:choice)`n$r`n$($script:said)" }"#;
     let powershell = asker_bin("powershell", &[r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"])?;
     let mut cmd = super::notify::powershell_at(powershell, PANEL);
-    cmd.env("TINCAN_TITLE", title).env("TINCAN_BODY", clip(question, 900)).env("TINCAN_SECS", OPEN_SECS.to_string());
+    cmd.env("TINCAN_TITLE", title).env("TINCAN_REQUEST", request).env("TINCAN_QUESTION", question);
+    cmd.env("TINCAN_SECS", OPEN_SECS.to_string());
     Some(cmd)
 }

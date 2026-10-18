@@ -602,16 +602,16 @@ fn tidy(s: &str, extra: &str, max: usize) -> Option<String> {
     (!t.is_empty()).then_some(t)
 }
 
-/// Validates a message from a peer and strips its metadata down to safe characters.
-/// Whether an approval that came from `peer` (a machine of `sender`'s) to the session `to` stands: signed by that
-/// machine for this team, as its own person's answer, to a request that session sent, and of a sane size. (Which request
-/// it answers is the approver's machine's word: the frame shows `about`, for the asking agent to match.)
+/// Whether an approval that came from `peer` (a machine of `sender`'s) to the session `to` stands: signed by that machine
+/// for this team, as its own person's answer, for that session, and of a sane size (in characters, as the sender cuts
+/// it). Which request it answers is the approver's machine's word: the frame shows `about`, for the agent to check.
 fn approval_holds(a: &Signed<Approval>, team: &str, peer: &EndpointId, sender: &str, to: &str) -> bool {
     let b = &a.body;
-    let size = b.about.len() + b.asker.len() + b.question.len() + b.request.len() + b.note.len();
-    size <= 4000 && a.by == *peer && b.approver == sender && b.asker == to && a.verify(team, "approval")
+    let size: usize = [&b.about, &b.asker, &b.question, &b.request, &b.note].iter().map(|s| s.chars().count()).sum();
+    size <= 2000 && a.by == *peer && b.approver == sender && b.asker == to && a.verify(team, "approval")
 }
 
+/// Validates a message from a peer and strips its metadata down to safe characters.
 fn clean(m: Message) -> Result<Message> {
     let ok = |s: &str, extra: &str| {
         !s.is_empty() && s.len() <= 120 && s.chars().all(|c| c.is_ascii_alphanumeric() || extra.contains(c))
@@ -677,8 +677,12 @@ mod tests {
         let mut changed = real.clone();
         changed.body.approved = false;
         assert!(!approval_holds(&changed, "acme", &bob.public(), "bob", "alice/api"));
+        // A full-size answer in any script stands; one bigger than the sender would make doesn't.
+        let mut cjk = approval("alice/api", "bob");
+        (cjk.request, cjk.question, cjk.note) = ("请".repeat(501), "吗".repeat(401), "好".repeat(500));
+        assert!(approval_holds(&Signed::new(cjk, &bob, "acme", "approval"), "acme", &bob.public(), "bob", "alice/api"));
         let mut big = approval("alice/api", "bob");
-        big.note = "x".repeat(5000);
+        big.note = "x".repeat(3000);
         let big = Signed::new(big, &bob, "acme", "approval");
         assert!(!approval_holds(&big, "acme", &bob.public(), "bob", "alice/api"));
     }
