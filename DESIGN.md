@@ -191,11 +191,12 @@ Three tools, none of which an agent has to call unless it wants to message someo
   your machines that is on (an agent that needs its user).
 - `check_inbox(wait_secs?)`: unread messages; can block waiting for a reply.
 - `ask_user(question)`: asks the session's own person with a pop-up on its machine and waits (up to 10 minutes) for
-  Approve or Deny, with a note: a dialog on macOS (Return approves, once they have stopped typing for 2 seconds), a
-  toast with a note box on Windows, a notification with buttons on Linux (no note). The answer is the tool's result,
-  not a message: no other session or machine can give it. One question per session is up at a time (asking again
-  waits for it); it stays up an hour, and an answer after the call gave up comes as a message from
-  `<person>/terminal`. No desktop: an error, so the agent asks in its own session.
+  Approve or Deny, with a note: on macOS a floating panel that doesn't take the keyboard (Return approves once it is
+  clicked into, Escape denies), on Windows a toast with a note box, on Linux a notification with buttons (no note;
+  libnotify 0.7.10+). The answer is the tool's result, not a message: only the pop-up on that machine gives it. One
+  question per session is up at a time (asking it again waits for it, another is refused until then); it stays up an
+  hour, and an answer after the call gave up comes as an ordinary message from `<person>/terminal`. No desktop: an
+  error, so the agent asks in its own session.
 
 Agents never report what they are doing; Reason Network reads it from what they record anyway (`doing.rs`): the
 session's title (Claude Code's `ai-title` transcript entries, Codex's thread names in

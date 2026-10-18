@@ -112,7 +112,7 @@ pub struct Daemon {
     /// When a notification from each sender was last shown here.
     shown: Mutex<HashMap<String, Instant>>,
     /// Each session's `ask_user` question that is up, with its answer once there is one.
-    asks: Mutex<HashMap<String, tokio::sync::watch::Sender<Option<ask::Answer>>>>,
+    asks: Mutex<HashMap<String, ask::Asking>>,
 }
 
 struct Inner {
@@ -277,7 +277,7 @@ impl Daemon {
             }
             Request::Inbox { key, wait_secs, peek } => json!(self.inbox(key, wait_secs.min(MAX_WAIT), peek).await?),
             Request::Unread { key } => json!(self.unread(&key)?),
-            Request::Ask { key, question, wait_secs } => json!(self.ask(key, question, wait_secs.min(MAX_WAIT)).await?),
+            Request::Ask { key, question } => json!(self.ask(key, question).await?),
             Request::StopWaiting { key } => {
                 self.stop_waiting(&key).await;
                 Value::Null

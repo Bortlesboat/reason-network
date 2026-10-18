@@ -55,7 +55,8 @@ pub struct SendArgs {
     /// Id of the message you are replying to.
     #[serde(default)]
     pub reply_to: Option<String>,
-    /// Also pop it up on that person's screen: a heads-up, for when they must act themselves.
+    /// Also pop it up on that person's screen: a heads-up, for when they must act themselves. `to` may then be your
+    /// own user's name, to reach them.
     #[serde(default)]
     pub notify: Option<bool>,
 }
@@ -168,16 +169,15 @@ impl ReasonNetworkMcp {
             Ok(k) => k,
             Err(e) => return Ok(failure(e)),
         };
-        let req = Request::Ask { key: key.clone(), question: a.question, wait_secs: 600 };
+        let req = Request::Ask { key: key.clone(), question: a.question };
         let got = tokio::select! {
             r = self.link.call::<String>(req) => r,
-            _ = ctx.ct.cancelled() => Ok(String::new()),
+            // The agent gave up on this call: the pop-up stays, and its answer comes as a message.
+            _ = ctx.ct.cancelled() => {
+                let _ = self.link.call::<Value>(Request::StopWaiting { key }).await;
+                return Ok(failure(anyhow::anyhow!("cancelled")));
+            }
         };
-        // The agent gave up on this call: the pop-up stays, and its answer comes as a message.
-        if ctx.ct.is_cancelled() {
-            let _ = self.link.call::<Value>(Request::StopWaiting { key }).await;
-            return Ok(failure(anyhow::anyhow!("cancelled")));
-        }
         Ok(self.finish(&key, got, true).await)
     }
 

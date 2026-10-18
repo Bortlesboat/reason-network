@@ -1,12 +1,11 @@
 //! `ask_user`: an agent asks its own person, with a pop-up on this machine, and gets the answer back as the tool's
-//! result: their own decision, not a message from anyone. A dialog with a note on macOS, a toast with one on Windows,
+//! result: their own decision, not a message from anyone. A panel with a note on macOS, a toast with one on Windows,
 //! a notification with buttons on Linux.
 
-use super::{Daemon, log, mail::unregistered};
+use super::{Daemon, MAX_WAIT, log, mail::unregistered};
 use crate::{proto::Message, util};
 use anyhow::{Result, anyhow, bail};
 use std::{process::Command, sync::Arc, time::Duration};
-use tokio::sync::watch;
 use ulid::Ulid;
 
 /// A pop-up nobody answers closes after this.
@@ -18,25 +17,40 @@ pub(super) enum Answer {
     Approved(String),
     Denied(String),
     /// Closed, or not answered in time.
-    None,
+    Unanswered,
     /// It couldn't be shown.
     Failed(String),
 }
 
+/// A session's question while it is up.
+pub(super) struct Asking {
+    question: String,
+    /// Calls waiting for its answer now.
+    waiting: usize,
+    answer: Option<Answer>,
+    /// Whether a waiting call has returned the answer.
+    taken: bool,
+}
+
 impl Daemon {
-    /// Asks this machine's person on behalf of the session `key`, and waits up to `wait_secs` for the answer. A
-    /// session has one question up at a time: asking again while it is up waits for that one. An answer that comes
-    /// once the session has stopped waiting reaches it as a message from its person.
-    pub(super) async fn ask(self: &Arc<Self>, key: String, question: String, wait_secs: u64) -> Result<String> {
+    /// Asks this machine's person on behalf of the session `key`, and waits for the answer. A session has one
+    /// question up at a time: asking it again waits for it, asking another is refused until it is answered. An answer
+    /// that comes once no call waits for it reaches the session as a message from its person.
+    pub(super) async fn ask(self: &Arc<Self>, key: String, question: String) -> Result<String> {
         let (asker, stop) = {
             let g = self.inner.lock().unwrap();
             let l = g.live.get(&key).ok_or_else(unregistered)?;
             (self.addr(&l.name), l.stop_gen)
         };
-        let mut answer = {
-            let mut open = self.asks.lock().unwrap();
-            match open.get(&key) {
-                Some(up) => up.subscribe(),
+        {
+            let mut asks = self.asks.lock().unwrap();
+            match asks.get_mut(&key) {
+                Some(up) if up.question != question => bail!(
+                    "your question \"{}\" is still up for {}: ask it again to keep waiting for its answer",
+                    util::one_line(&up.question, 200),
+                    self.person
+                ),
+                Some(up) => up.waiting += 1,
                 None => {
                     let cmd = dialog(&format!("{asker} asks"), &question).ok_or_else(|| {
                         anyhow!(
@@ -45,21 +59,21 @@ impl Daemon {
                             self.person
                         )
                     })?;
-                    let (tx, rx) = watch::channel(None);
-                    open.insert(key.clone(), tx);
+                    let up = Asking { question: question.clone(), waiting: 1, answer: None, taken: false };
+                    asks.insert(key.clone(), up);
                     tokio::spawn(self.clone().pop_up(key.clone(), question, cmd));
-                    rx
                 }
             }
-        };
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_secs);
+        }
+        let waiting = Waiting { daemon: self, key: &key };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(MAX_WAIT);
         loop {
-            // The client giving up on the call (`StopWaiting`) wakes `arrived`.
-            let stopped = self.arrived.notified();
-            tokio::pin!(stopped);
-            stopped.as_mut().enable();
-            if let Some(a) = answer.borrow_and_update().clone() {
-                return self.said(&a);
+            // The answer, and the client giving up on the call (`StopWaiting`), both wake `arrived`.
+            let woke = self.arrived.notified();
+            tokio::pin!(woke);
+            woke.as_mut().enable();
+            if let Some(answer) = waiting.take() {
+                return self.said(&answer);
             }
             let gave_up = self.inner.lock().unwrap().live.get(&key).is_none_or(|l| l.stop_gen != stop);
             if gave_up || tokio::time::Instant::now() >= deadline {
@@ -69,10 +83,7 @@ impl Daemon {
                     self.person
                 ));
             }
-            tokio::select! {
-                changed = answer.changed() => if changed.is_err() { return self.said(&Answer::None) },
-                _ = tokio::time::timeout_at(deadline, stopped) => {}
-            }
+            let _ = tokio::time::timeout_at(deadline, woke).await;
         }
     }
 
@@ -82,14 +93,14 @@ impl Daemon {
         Ok(match answer {
             Answer::Approved(n) => format!("{} approved.{}", self.person, note(n)),
             Answer::Denied(n) => format!("{} said no.{}", self.person, note(n)),
-            Answer::None => format!("{} didn't answer.", self.person),
+            Answer::Unanswered => format!("{} didn't answer.", self.person),
             Answer::Failed(e) => {
                 bail!("couldn't ask {} with a pop-up ({e}): ask them in your own session", self.person)
             }
         })
     }
 
-    /// Shows the question until it is answered or closes, then hands the answer to whoever waits for it.
+    /// Shows the question until it is answered or closes, then hands the answer to the calls waiting for it.
     async fn pop_up(self: Arc<Self>, key: String, question: String, cmd: Command) {
         let mut cmd = tokio::process::Command::from(cmd);
         let out = tokio::time::timeout(Duration::from_secs(OPEN_SECS + 60), cmd.kill_on_drop(true).output()).await;
@@ -97,19 +108,29 @@ impl Daemon {
             Ok(Ok(o)) if o.status.success() => parse(&String::from_utf8_lossy(&o.stdout)),
             Ok(Ok(o)) => Answer::Failed(String::from_utf8_lossy(&o.stderr).trim().to_string()),
             Ok(Err(e)) => Answer::Failed(e.to_string()),
-            Err(_) => Answer::None,
+            Err(_) => Answer::Unanswered,
         };
         if let Answer::Failed(e) = &answer {
             log(&format!("pop-up failed: {e}"));
         }
-        let Some(tx) = self.asks.lock().unwrap().remove(&key) else { return };
-        // Nobody waits for it any more: the answer goes to the session as a message from its person.
-        if tx.send(Some(answer.clone())).is_err() && matches!(answer, Answer::Approved(_) | Answer::Denied(_)) {
+        let mut asks = self.asks.lock().unwrap();
+        let Some(up) = asks.get_mut(&key) else { return };
+        if up.waiting > 0 {
+            up.answer = Some(answer);
+            drop(asks);
+            self.arrived.notify_waiters();
+        } else {
+            asks.remove(&key);
+            drop(asks);
             self.answer_later(&key, &question, &answer);
         }
     }
 
+    /// An answer no call waited for any more: to the session, as a message from its person.
     fn answer_later(self: &Arc<Self>, key: &str, question: &str, answer: &Answer) {
+        if !matches!(answer, Answer::Approved(_) | Answer::Denied(_)) {
+            return;
+        }
         let Ok(said) = self.said(answer) else { return };
         let mut g = self.inner.lock().unwrap();
         let Some(to) = g.live.get(key).map(|l| self.addr(&l.name)) else {
@@ -137,6 +158,40 @@ impl Daemon {
     }
 }
 
+/// A call waiting for its session's question, counted for as long as it waits: when the last one leaves without the
+/// answer, the answer goes to the session as a message instead.
+struct Waiting<'a> {
+    daemon: &'a Arc<Daemon>,
+    key: &'a str,
+}
+
+impl Waiting<'_> {
+    fn take(&self) -> Option<Answer> {
+        let mut asks = self.daemon.asks.lock().unwrap();
+        let up = asks.get_mut(self.key)?;
+        up.taken |= up.answer.is_some();
+        up.answer.clone()
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        let mut asks = self.daemon.asks.lock().unwrap();
+        let Some(up) = asks.get_mut(self.key) else { return };
+        up.waiting -= 1;
+        if up.waiting > 0 || up.answer.is_none() {
+            return;
+        }
+        let up = asks.remove(self.key).expect("just looked up");
+        drop(asks);
+        if !up.taken
+            && let Some(answer) = up.answer
+        {
+            self.daemon.answer_later(self.key, &up.question, &answer);
+        }
+    }
+}
+
 /// `approve` or `deny` on the first line, the note after it; anything else is no answer.
 fn parse(out: &str) -> Answer {
     let (choice, note) = out.trim().split_once('\n').unwrap_or((out.trim(), ""));
@@ -144,38 +199,65 @@ fn parse(out: &str) -> Answer {
     match choice.trim().to_lowercase().as_str() {
         "approve" => Answer::Approved(note),
         "deny" => Answer::Denied(note),
-        _ => Answer::None,
+        _ => Answer::Unanswered,
     }
 }
 
-/// Prints the button clicked and, on the next line, the note; nothing if nobody answered. Return approves, so it
-/// waits for the person to stop typing for 2 seconds (5 minutes at most): what they type elsewhere can't answer it.
+/// A floating panel with a note box, Deny (Escape) and Approve (Return). It shows on top without taking the keyboard,
+/// so nothing typed elsewhere reaches it; it gets keys once clicked. Prints the button and the note; nothing if it
+/// closed unanswered.
 #[cfg(target_os = "macos")]
-const DIALOG: &str = r#"on run argv
-	repeat 600 times
-		set secs to do shell script "ioreg -c IOHIDSystem | awk '/HIDIdleTime/ {print int($NF / 1000000000); exit}'"
-		if (secs as integer) ≥ 2 then exit repeat
-		delay 0.5
-	end repeat
-	set answer to display dialog (item 2 of argv) with title (item 1 of argv) default answer "" ¬
-		buttons {"Deny", "Approve"} default button "Approve" ICON giving up after (item 3 of argv as integer)
-	if gave up of answer then return ""
-	return (button returned of answer) & linefeed & (text returned of answer)
-end run"#;
+const PANEL: &str = r#"ObjC.import("Cocoa")
+function run([title, question, secs, icon]) {
+  const app = $.NSApplication.sharedApplication
+  app.setActivationPolicy($.NSApplicationActivationPolicyAccessory)
+  let choice = ""
+  ObjC.registerSubclass({ name: "Answer", methods: {
+    "approve:": { types: ["void", ["id"]], implementation: () => { choice = "approve"; app.stop(null) } },
+    "deny:": { types: ["void", ["id"]], implementation: () => { choice = "deny"; app.stop(null) } },
+  } })
+  const answer = $.Answer.alloc.init
+  const label = $.NSTextField.wrappingLabelWithString(question)
+  label.preferredMaxLayoutWidth = 330
+  const h = Math.min(Math.max(label.fittingSize.height, 48), 320)
+  // Titled, non-activating: it doesn't take the keyboard from the app in front.
+  const panel = $.NSPanel.alloc.initWithContentRectStyleMaskBackingDefer($.NSMakeRect(0, 0, 440, h + 96), 1 | 128, 2, false)
+  panel.title = title
+  panel.level = 8
+  panel.becomesKeyOnlyIfNeeded = true
+  const put = (view, x, y, w, vh) => { view.frame = $.NSMakeRect(x, y, w, vh); panel.contentView.addSubview(view) }
+  put(label, 86, 84, 330, h)
+  const image = icon && $.NSImage.alloc.initWithContentsOfFile(icon)
+  if (image && !image.isNil()) put($.NSImageView.imageViewWithImage(image), 20, h + 28, 48, 48)
+  const note = $.NSTextField.alloc.init
+  note.placeholderString = "Note (optional)"
+  note.target = answer
+  note.action = "approve:"
+  put(note, 86, 48, 330, 24)
+  const button = (name, x, action, key) => {
+    const b = $.NSButton.buttonWithTitleTargetAction(name, answer, action)
+    b.keyEquivalent = key
+    put(b, x, 10, 96, 30)
+  }
+  button("Deny", 220, "deny:", "\u001b")
+  button("Approve", 320, "approve:", "\r")
+  panel.center
+  panel.orderFrontRegardless
+  $.NSTimer.scheduledTimerWithTimeIntervalTargetSelectorUserInfoRepeats(Number(secs), app, "stop:", null, false)
+  app.run
+  return choice && `${choice}\n${note.stringValue.js}`
+}"#;
 
 #[cfg(target_os = "macos")]
 fn dialog(title: &str, question: &str) -> Option<Command> {
     let mut cmd = Command::new(crate::agent::find_bin("osascript")?);
     let question: String = util::printable(question).trim().chars().take(1500).collect();
-    let (icon, path) = match icon() {
-        Some(path) => ("with icon (POSIX file (item 4 of argv))", path.display().to_string()),
-        None => ("with icon note", String::new()),
-    };
-    cmd.args(["-e", &DIALOG.replace("ICON", icon), title, &question, &OPEN_SECS.to_string(), &path]);
+    let icon = icon().map(|p| p.display().to_string()).unwrap_or_default();
+    cmd.args(["-l", "JavaScript", "-e", PANEL, title, &question, &OPEN_SECS.to_string(), &icon]);
     Some(cmd)
 }
 
-/// Reason's icon for the dialog, kept beside the network's database.
+/// Reason's icon for the panel, kept beside the network's database.
 #[cfg(target_os = "macos")]
 fn icon() -> Option<std::path::PathBuf> {
     const ICON: &[u8] = include_bytes!("../../assets/reason.icns");
@@ -187,6 +269,7 @@ fn icon() -> Option<std::path::PathBuf> {
 }
 
 /// A notification with buttons: notify-send prints the one clicked, or nothing if it was closed or expired.
+/// (`--wait` and `--action` need libnotify 0.7.10, from 2021; with an older one asking fails, and says so.)
 #[cfg(all(unix, not(target_os = "macos")))]
 fn dialog(title: &str, question: &str) -> Option<Command> {
     use super::notify::{markup, notify_send};
@@ -197,7 +280,8 @@ fn dialog(title: &str, question: &str) -> Option<Command> {
     Some(cmd)
 }
 
-/// A toast with a note box and the two buttons (Return in the box approves); prints the button and the note.
+/// A toast with a note box and the two buttons (Return in the box approves); prints the button and the note. Taken
+/// down if nobody answers in time.
 #[cfg(windows)]
 fn dialog(title: &str, question: &str) -> Option<Command> {
     const ASK: &str = r#"$ErrorActionPreference = 'Stop'
@@ -209,10 +293,11 @@ $x.LoadXml("<toast scenario='reminder'><visual><binding template='ToastGeneric'>
 $t = [Windows.UI.Notifications.ToastNotification]::new($x)
 $null = Register-ObjectEvent $t Activated -SourceIdentifier answered
 $null = Register-ObjectEvent $t Dismissed -SourceIdentifier closed
-$app = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
-[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show($t)
-$a = (Wait-Event -Timeout $env:TINCAN_SECS).SourceArgs[1] -as [Windows.UI.Notifications.ToastActivatedEventArgs]
-if ($a) { $a.Arguments; $a.UserInput['note'] }"#;
+$n = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe')
+$n.Show($t)
+$ev = Wait-Event -Timeout $env:TINCAN_SECS
+if (-not $ev) { $n.Hide($t) }
+elseif ($a = $ev.SourceArgs[1] -as [Windows.UI.Notifications.ToastActivatedEventArgs]) { $a.Arguments; $a.UserInput['note'] }"#;
     let mut cmd = super::notify::powershell(ASK)?;
     cmd.env("TINCAN_TITLE", title).env("TINCAN_BODY", question).env("TINCAN_SECS", OPEN_SECS.to_string());
     Some(cmd)
