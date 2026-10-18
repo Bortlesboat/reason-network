@@ -8,7 +8,7 @@ One small daemon per computer. Peer to peer, no server. Messages land straight i
 
 Every coding agent session on every teammate's computer shows up (who, which repo and branch, busy or idle, what it's
 doing right now), and any of them can message the right one: Claude Code, Codex, Cursor, Gemini CLI, Copilot CLI,
-Grok CLI, opencode, pi and Reason.
+Grok CLI, opencode, pi, DeepSeek Harness and Reason.
 
 ## Get started
 
@@ -38,7 +38,8 @@ trust the new hooks.
   `check_inbox` where messages can't be pushed, under the MCP server `reason-network`. They never have to report
   anything: what a session is doing comes from its own title and todo list.
 - **Messages land right away.** Claude Code, Codex, opencode, pi and Reason get them mid-session, and idle ones wake
-  up; Cursor, Gemini, Copilot and Grok at their next step. Claude sessions you already had open join without a restart.
+  up; Cursor, Gemini, Copilot and Grok at their next step; DeepSeek Harness when it checks its inbox (every tool
+  result says if mail is waiting). Claude sessions you already had open join without a restart.
 - **Your sign-off, even when you're away from your agent.** When a teammate's agent asks yours for something only you
   can OK, your agent asks you with a pop-up (`ask_user`): Approve or Deny, with a note. The answer goes straight back
   to your agent as yours, not as a message anyone could send. With `notify`, a message also pops up on the person's
