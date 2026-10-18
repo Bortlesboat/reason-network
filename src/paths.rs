@@ -81,9 +81,18 @@ fn socket_in(home: &Path) -> PathBuf {
 /// A named pipe, named for the home directory so every client agrees on it.
 #[cfg(windows)]
 pub fn socket() -> PathBuf {
-    let home = home();
-    let stem = if stem(&home) == LEGACY_NAME { LEGACY_NAME } else { "reason-network" };
-    PathBuf::from(format!(r"\\.\pipe\{stem}-{:016x}", hash(&home)))
+    pipe_in(&home())
+}
+
+/// Named for the directory as Windows knows it, not as it was spelled: `C:/Users/alex/.reason/network` and
+/// `c:\users\alex\.reason\network\` are one directory, with one lock file, so they must be one pipe. (Before the
+/// directory exists, as spelled; the daemon creating it names the pipe by what it then finds.)
+#[cfg(windows)]
+fn pipe_in(home: &Path) -> PathBuf {
+    let stem = if stem(home) == LEGACY_NAME { LEGACY_NAME } else { "reason-network" };
+    let dir = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+    let dir = dir.to_str().and_then(|s| s.strip_prefix(r"\\?\")).map_or(dir.clone(), PathBuf::from);
+    PathBuf::from(format!(r"\\.\pipe\{stem}-{:016x}", hash(&dir)))
 }
 
 /// FNV-1a: stable across builds, unlike `DefaultHasher`.
@@ -235,4 +244,20 @@ pub fn ensure_home() -> std::io::Result<()> {
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut dir, 0o700);
     dir.recursive(true).create(home())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[cfg(windows)]
+    fn every_spelling_of_the_home_names_one_pipe() {
+        let dir = std::env::temp_dir().join(format!("reason-network-home-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let spelled = dir.to_str().unwrap();
+        let slashes = spelled.replace('\\', "/");
+        let shouting = format!("{}\\", spelled.to_uppercase());
+        assert_eq!(super::pipe_in(&dir), super::pipe_in(std::path::Path::new(&slashes)));
+        assert_eq!(super::pipe_in(&dir), super::pipe_in(std::path::Path::new(&shouting)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
