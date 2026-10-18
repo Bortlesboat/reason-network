@@ -268,6 +268,7 @@ impl Daemon {
         let ids: Vec<String> = msgs.iter().map(|m| m.id.clone()).collect();
         let cli = matches!(channel, Channel::ClaudeDirect(_));
         let text = render::for_agent(&msgs, Some(&l.reg.agent), cli);
+        let claude_session = l.reg.agent_session_id.clone();
         let hook_note = if matches!(l.reg.agent.as_str(), "opencode" | "pi") {
             "queued: delivered within seconds once the session is idle"
         } else if l.reg.agent == "cli" {
@@ -308,10 +309,9 @@ impl Daemon {
                     g.in_flight.insert(id.clone(), Instant::now());
                 }
                 self.post_direct(key.to_string(), sock, ids, text);
-                (
-                    "pushed".into(),
-                    "delivered into the session: it reads it between tool calls, or wakes up if idle".into(),
-                )
+                let note = claude::held_note(claude_session.as_deref())
+                    .unwrap_or("delivered into the session: it reads it between tool calls, or wakes up if idle");
+                ("pushed".into(), note.into())
             }
             Channel::Hook => ("queued".into(), hook_note.into()),
             Channel::Pull => ("queued".into(), "queued: this agent only sees it when it checks its inbox".into()),
