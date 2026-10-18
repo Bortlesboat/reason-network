@@ -683,7 +683,11 @@ const DSH_BEGIN: &str = "# === reason-network MCP BEGIN ===";
 const DSH_END: &str = "# === reason-network MCP END ===";
 
 fn dsh_home() -> PathBuf {
-    std::env::var_os("DSH_HOME").filter(|h| !h.is_empty()).map(PathBuf::from).unwrap_or_else(|| home().join(".dsh"))
+    // dsh takes a blank `DSH_HOME` for unset, spaces included.
+    std::env::var_os("DSH_HOME")
+        .filter(|h| !h.to_string_lossy().trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".dsh"))
 }
 
 /// dsh applies this file on top of every profile, those made later too.
@@ -708,12 +712,22 @@ fn dsh_block(exe: &Path) -> String {
 }
 
 fn dsh_wired(text: &str, exe: &Path) -> bool {
-    contains(text, &format!("serverName: {AGENT_NAME}")) && contains(text, &dsh_command(exe))
+    dsh_has_server(text) && contains(&dsh_entries(text).join("\n"), &dsh_command(exe))
 }
 
 /// The lines of a patch file that are neither blank nor comments.
 fn dsh_entries(text: &str) -> Vec<&str> {
     text.lines().filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#')).collect()
+}
+
+/// Whether an entry of the file (not a comment) names an MCP server `reason-network`, quoted or not.
+fn dsh_has_server(text: &str) -> bool {
+    dsh_entries(text).iter().any(|l| {
+        let line = l.trim_start().trim_start_matches("- ").trim_start();
+        line.strip_prefix("serverName:").is_some_and(|name| {
+            name.split(" #").next().unwrap_or_default().trim().trim_matches(['\'', '"']) == AGENT_NAME
+        })
+    })
 }
 
 /// A patch file's text with `block` in it (in place of the one it has), or without ours when `remove`. `None`: nothing
@@ -743,7 +757,7 @@ fn dsh_patch_text(text: &str, block: &str, remove: bool) -> Result<Option<String
         Some((b, e)) => format!("{}{block}{}", &text[..b], &text[e..]),
         None if remove => return Ok(None),
         None => {
-            if text.contains(&format!("serverName: {AGENT_NAME}")) {
+            if dsh_has_server(text) {
                 return Err(anyhow!("it already has a {AGENT_NAME} MCP server of your own; left as is"));
             }
             let entries = dsh_entries(text);
@@ -751,7 +765,8 @@ fn dsh_patch_text(text: &str, block: &str, remove: bool) -> Result<Option<String
                 None => format!("{text}{}{block}", if text.is_empty() || text.ends_with('\n') { "" } else { eol }),
                 Some(first) if first.trim_end() == "[]" && entries.len() == 1 => {
                     let rest: Vec<&str> = text.lines().filter(|l| l.trim_end() != "[]").collect();
-                    format!("{}{eol}{block}", rest.join(eol))
+                    // A file that was only the list becomes our block, with no blank line above it.
+                    if rest.is_empty() { block } else { format!("{}{eol}{block}", rest.join(eol)) }
                 }
                 Some(first) if first.starts_with("- ") => {
                     let gap = if text.ends_with('\n') { eol.to_string() } else { format!("{eol}{eol}") };
@@ -790,7 +805,8 @@ fn dsh(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
             }
         }
         Ok(None) => r.lines.push(changed(&path, false)),
-        Err(e) => r.notes.push(format!("DeepSeek Harness: {}: {e:#}", crate::util::tilde(&path.display().to_string()))),
+        // Skipped, not set up: `apply` says so, and the wizard doesn't count it among the agents it set up.
+        Err(e) => return Err(anyhow!("{}: {e:#}", crate::util::tilde(&path.display().to_string()))),
     }
     Ok(Some(r))
 }
@@ -1544,6 +1560,22 @@ mod tests {
         let why = dsh_patch_text(own, &block, false).unwrap_err().to_string();
         assert!(why.contains("of your own"), "{why}");
         assert_eq!(dsh_patch_text(own, &block, true).unwrap(), None, "`--remove` leaves it");
+        // However YAML quotes the name; a comment about it is not a server.
+        for quoted in ["\"reason-network\"", "'reason-network'", "reason-network # mine"] {
+            let own = format!("- insert:\n    - config:\n        serverName: {quoted}\n");
+            assert!(dsh_patch_text(&own, &block, false).is_err(), "{quoted}");
+        }
+        let commented = "# serverName: reason-network\n- id: agent-loop\n";
+        assert!(dsh_patch_text(commented, &block, false).unwrap().unwrap().contains(&block), "commented out");
+        assert!(!dsh_wired("# serverName: reason-network\n", Path::new("/x/reason-network")));
+    }
+
+    #[test]
+    fn dsh_patch_that_is_only_the_empty_list_round_trips() {
+        let block = dsh_block(Path::new("/x/reason-network"));
+        let with = dsh_patch_text("[]\n", &block, false).unwrap().unwrap();
+        assert_eq!(with, block, "no blank line above our block");
+        assert_eq!(dsh_patch_text(&with, &block, true).unwrap().as_deref(), Some("[]\n"));
     }
 
     #[test]
