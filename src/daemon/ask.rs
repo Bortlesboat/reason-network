@@ -1,6 +1,6 @@
 //! `ask_user`: an agent asks its own person, with a pop-up on this machine, and gets the answer back as the tool's
-//! result: their own decision, not a message from anyone. A panel with a note on macOS, a toast with one on Windows,
-//! a notification with buttons on Linux.
+//! result: their own decision, not a message from anyone. A panel with a note on macOS and Windows, a notification
+//! with buttons on Linux.
 
 use super::{Daemon, MAX_WAIT, log, mail::unregistered};
 use crate::{proto::Message, util};
@@ -204,8 +204,8 @@ fn parse(out: &str) -> Answer {
 }
 
 /// A floating panel with a note box, Deny (Escape) and Approve (Return). It shows on top without taking the keyboard,
-/// so nothing typed elsewhere reaches it; it gets keys once clicked. Prints the button and the note; nothing if it
-/// closed unanswered.
+/// so nothing typed elsewhere reaches it; it gets keys once clicked, in the note box. Prints the button and the note;
+/// nothing if it closed unanswered.
 #[cfg(target_os = "macos")]
 const PANEL: &str = r#"ObjC.import("Cocoa")
 function run([title, question, secs, icon]) {
@@ -213,8 +213,8 @@ function run([title, question, secs, icon]) {
   app.setActivationPolicy($.NSApplicationActivationPolicyAccessory)
   let choice = ""
   ObjC.registerSubclass({ name: "Answer", methods: {
-    "approve:": { types: ["void", ["id"]], implementation: () => { choice = "approve"; app.stop(null) } },
-    "deny:": { types: ["void", ["id"]], implementation: () => { choice = "deny"; app.stop(null) } },
+    "approve:": { types: ["void", ["id"]], implementation: () => { choice = `approve\n${note.stringValue.js}`; app.stop(null) } },
+    "deny:": { types: ["void", ["id"]], implementation: () => { choice = `deny\n${note.stringValue.js}`; app.stop(null) } },
   } })
   const answer = $.Answer.alloc.init
   const label = $.NSTextField.wrappingLabelWithString(question)
@@ -234,6 +234,7 @@ function run([title, question, secs, icon]) {
   note.target = answer
   note.action = "approve:"
   put(note, 86, 48, 330, 24)
+  panel.initialFirstResponder = note
   const button = (name, x, action, key) => {
     const b = $.NSButton.buttonWithTitleTargetAction(name, answer, action)
     b.keyEquivalent = key
@@ -245,7 +246,7 @@ function run([title, question, secs, icon]) {
   panel.orderFrontRegardless
   $.NSTimer.scheduledTimerWithTimeIntervalTargetSelectorUserInfoRepeats(Number(secs), app, "stop:", null, false)
   app.run
-  return choice && `${choice}\n${note.stringValue.js}`
+  return choice
 }"#;
 
 #[cfg(target_os = "macos")]
@@ -280,25 +281,31 @@ fn dialog(title: &str, question: &str) -> Option<Command> {
     Some(cmd)
 }
 
-/// A toast with a note box and the two buttons (Return in the box approves); prints the button and the note. Taken
-/// down if nobody answers in time.
+/// The same panel as on macOS: shown on top without taking the keyboard (once clicked into, Return approves and Escape
+/// denies); prints the button and the note.
 #[cfg(windows)]
 fn dialog(title: &str, question: &str) -> Option<Command> {
-    const ASK: &str = r#"$ErrorActionPreference = 'Stop'
-$null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
-$null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime]
-$e = [Security.SecurityElement]
-$x = [Windows.Data.Xml.Dom.XmlDocument]::new()
-$x.LoadXml("<toast scenario='reminder'><visual><binding template='ToastGeneric'><text>$($e::Escape($env:TINCAN_TITLE))</text><text>$($e::Escape($env:TINCAN_BODY))</text></binding></visual><actions><input id='note' type='text' placeHolderContent='Note (optional)'/><action content='Approve' arguments='approve' hint-inputId='note'/><action content='Deny' arguments='deny'/></actions></toast>")
-$t = [Windows.UI.Notifications.ToastNotification]::new($x)
-$null = Register-ObjectEvent $t Activated -SourceIdentifier answered
-$null = Register-ObjectEvent $t Dismissed -SourceIdentifier closed
-$n = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe')
-$n.Show($t)
-$ev = Wait-Event -Timeout $env:TINCAN_SECS
-if (-not $ev) { $n.Hide($t) }
-elseif ($a = $ev.SourceArgs[1] -as [Windows.UI.Notifications.ToastActivatedEventArgs]) { $a.Arguments; $a.UserInput['note'] }"#;
-    let mut cmd = super::notify::powershell(ASK)?;
+    const PANEL: &str = r#"$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+# Shown on top without taking the keyboard: what's typed elsewhere can't answer it; once clicked into, Return approves.
+Add-Type -WarningAction SilentlyContinue -ReferencedAssemblies System.Windows.Forms -TypeDefinition 'public class AskPanel : System.Windows.Forms.Form { protected override bool ShowWithoutActivation { get { return true; } } }'
+$f = New-Object AskPanel
+$f.Text = $env:TINCAN_TITLE; $f.TopMost = $true; $f.StartPosition = 'CenterScreen'; $f.FormBorderStyle = 'FixedDialog'
+$f.MinimizeBox = $false; $f.MaximizeBox = $false; $f.AutoSize = $true; $f.AutoSizeMode = 'GrowAndShrink'; $f.Padding = 12
+$l = New-Object Windows.Forms.FlowLayoutPanel; $l.FlowDirection = 'TopDown'; $l.AutoSize = $true
+$q = New-Object Windows.Forms.Label; $q.Text = $env:TINCAN_BODY; $q.AutoSize = $true; $q.MaximumSize = '420,320'
+$note = New-Object Windows.Forms.TextBox; $note.Width = 420
+$b = New-Object Windows.Forms.FlowLayoutPanel; $b.FlowDirection = 'RightToLeft'; $b.Width = 420; $b.Height = 34
+$yes = New-Object Windows.Forms.Button; $yes.Text = 'Approve'; $no = New-Object Windows.Forms.Button; $no.Text = 'Deny'
+$b.Controls.AddRange(@($yes, $no)); $l.Controls.AddRange(@($q, $note, $b)); $f.Controls.Add($l)
+$f.AcceptButton = $yes; $f.CancelButton = $no; $f.ActiveControl = $note
+$script:choice = ''
+$yes.Add_Click({ $script:choice = "approve`n" + $note.Text; $f.Close() })
+$no.Add_Click({ $script:choice = "deny`n" + $note.Text; $f.Close() })
+$t = New-Object Windows.Forms.Timer; $t.Interval = [int]$env:TINCAN_SECS * 1000; $t.Add_Tick({ $f.Close() }); $t.Start()
+[Windows.Forms.Application]::Run($f)
+$script:choice"#;
+    let mut cmd = super::notify::powershell(PANEL)?;
     cmd.env("TINCAN_TITLE", title).env("TINCAN_BODY", question).env("TINCAN_SECS", OPEN_SECS.to_string());
     Some(cmd)
 }
